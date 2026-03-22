@@ -2,11 +2,10 @@ import pandas as pd
 import math
 from datamodel import Order, TradingState
 mid_prices = []
-# this is outperformed by the market making algorithms when both algorithms only trade tomatoes 
 class Trader:
     def run(self, state: TradingState):
         result = {}
-        Span = 2500
+        Span = 1000
         for prod, od in state.order_depths.items():
             if prod != 'TOMATOES':
                 result[prod] = []
