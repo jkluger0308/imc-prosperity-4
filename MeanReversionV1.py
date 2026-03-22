@@ -2,6 +2,7 @@ import pandas as pd
 import math
 from datamodel import Order, TradingState
 mid_prices = []
+# this is outperformed by the market making algorithms when both algorithms only trade tomatoes 
 class Trader:
     def run(self, state: TradingState):
         result = {}
