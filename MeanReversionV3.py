@@ -3,6 +3,7 @@ import math
 from datamodel import Order, TradingState
 mid_prices = []
 # WE BROKE THE 2518 BARRIER
+# current limit: 2598
 # key strat: adjust prices that you place orders at when expecting price to go up or down
 class Trader:
     def run(self, state: TradingState):
@@ -37,27 +38,27 @@ class Trader:
              pos = state.position.get(prod, 0)
              orders = []
              spread = ba-bb
-             if mid - ewm.iloc[len(ewm) - 1] <= -0.5:
+             if mid - ewm.iloc[len(ewm) - 1] <= -0.25:
                  buy_room = 80 - pos
                  sell_room = 80 + pos
                  if spread >= 2 and mid - ewm.iloc[len(ewm) - 1] > -2:
-                     orders.append(Order(prod, ba-1, -min(15, sell_room)))
+                     orders.append(Order(prod, ba-1, -min(40, sell_room)))
                  if mid - ewm.iloc[len(ewm) - 1] <= -2:
                      if buy_room > 0:
-                         orders.append(Order(prod, bb+2, min(40, buy_room)))
+                         orders.append(Order(prod, bb+2, buy_room))
                  else:
                     if buy_room > 0:
-                        orders.append(Order(prod, bb+1, min(40, buy_room)))
-             if mid - ewm.iloc[len(ewm) - 1] >= 0.5:
+                        orders.append(Order(prod, bb+1, buy_room))
+             if mid - ewm.iloc[len(ewm) - 1] >= 0.25:
                  sell_room = 80 + pos
                  buy_room = 80 - pos
                  if spread >= 2 and mid - ewm.iloc[len(ewm) - 1] < 2:
-                     orders.append(Order(prod, bb+1, min(15, buy_room)))
+                     orders.append(Order(prod, bb+1, min(40, buy_room)))
                  if mid - ewm.iloc[len(ewm) - 1] >= 2:
                      if sell_room > 0:
-                         orders.append(Order(prod, ba-2, -min(40, sell_room)))
+                         orders.append(Order(prod, ba-2, -sell_room))
                  else:
                      if sell_room > 0:
-                         orders.append(Order(prod, ba-1, -min(40, sell_room)))
+                         orders.append(Order(prod, ba-1, -sell_room))
             result[prod] = orders
         return result, 0, ""
