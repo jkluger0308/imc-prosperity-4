@@ -3,7 +3,7 @@ import math
 from datamodel import Order, TradingState
 mid_prices = []
 # WE BROKE THE 2518 BARRIER
-# current limit: 2598
+# current limit: 2613
 # key strat: adjust prices that you place orders at when expecting price to go up or down
 class Trader:
     def run(self, state: TradingState):
