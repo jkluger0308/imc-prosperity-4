@@ -2,6 +2,9 @@ import pandas as pd
 import math
 from datamodel import Order, TradingState
 
+#   this model gets 2513 rn
+
+
 mid_prices = []
 
 # Bollinger Band strats
