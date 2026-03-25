@@ -2,9 +2,7 @@ import pandas as pd
 import math
 from datamodel import Order, TradingState
 mid_prices = []
-# WE BROKE THE 2518 BARRIER
-# current limit: 2613
-# key strat: adjust prices that you place orders at when expecting price to go up or down
+# Limit: 2640
 class Trader:
     def run(self, state: TradingState):
         result = {}
@@ -42,23 +40,31 @@ class Trader:
                  buy_room = 80 - pos
                  sell_room = 80 + pos
                  if spread >= 2 and mid - ewm.iloc[len(ewm) - 1] > -2:
-                     orders.append(Order(prod, ba-1, -min(40, sell_room)))
+                    if sell_room > 0:
+                     orders.append(Order(prod, ba-1, -min(10, sell_room)))
                  if mid - ewm.iloc[len(ewm) - 1] <= -2:
                      if buy_room > 0:
                          orders.append(Order(prod, bb+2, buy_room))
                  else:
                     if buy_room > 0:
                         orders.append(Order(prod, bb+1, buy_room))
-             if mid - ewm.iloc[len(ewm) - 1] >= 0.25:
+             elif mid - ewm.iloc[len(ewm) - 1] >= 0.25:
                  sell_room = 80 + pos
                  buy_room = 80 - pos
                  if spread >= 2 and mid - ewm.iloc[len(ewm) - 1] < 2:
-                     orders.append(Order(prod, bb+1, min(40, buy_room)))
+                    if buy_room > 0:
+                     orders.append(Order(prod, bb+1, min(10, buy_room)))
                  if mid - ewm.iloc[len(ewm) - 1] >= 2:
                      if sell_room > 0:
                          orders.append(Order(prod, ba-2, -sell_room))
                  else:
                      if sell_room > 0:
                          orders.append(Order(prod, ba-1, -sell_room))
+             else:
+                if spread >= 2:
+                    if buy_room > 0:
+                        orders.append(Order(prod, bb + 1, min(10, buy_room)))
+                    if sell_room > 0:
+                        orders.append(Order(prod, ba - 1, -min(10, sell_room)))
             result[prod] = orders
         return result, 0, ""
