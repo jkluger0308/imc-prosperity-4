@@ -1,0 +1,186 @@
+import pandas as pd
+import math
+from datamodel import Order, TradingState
+
+mid_prices = []
+
+# Bollinger Band strats
+# prob not going to be usefuul in this round, maybe in round2/3
+
+BB_WINDOW   = 100    # rolling window for mean and stdev
+BB_STD_MULT = 2.0    # r (2 sigma)
+EWM_SPAN    = 1050   # slow EWM for mean reversion anchor 
+FAST_SPAN   = 250    # fast EMA for trend direction
+SLOW_SPAN   = 1000   # slow EMA for trend direction
+RSI_N       = 15     # RSI lookback 
+POS_LIMIT   = 80
+
+class Trader:
+    def run(self, state: TradingState):
+        result = {}
+#ems, plain market make
+        for prod, od in state.order_depths.items():
+
+        
+            if prod == 'EMERALDS':
+                if not od.buy_orders or not od.sell_orders:
+                    result[prod] = []
+                    continue
+                orders = []
+                bb, ba = max(od.buy_orders), min(od.sell_orders)
+                pos = state.position.get(prod, 0)
+                if ba - bb >= 2:
+                    buy_room  = POS_LIMIT - pos
+                    sell_room = POS_LIMIT + pos
+                    if buy_room  > 0: orders.append(Order(prod, bb + 1,  min(15, buy_room)))
+                    if sell_room > 0: orders.append(Order(prod, ba - 1, -min(15, sell_room)))
+                result[prod] = orders
+
+            #  TOMATOES: Bollinger Band + momentum to confirm 
+            elif prod == 'TOMATOES':
+                if not od.buy_orders or not od.sell_orders:
+                    result[prod] = []
+                    continue
+
+                bb_price, ba_price = max(od.buy_orders), min(od.sell_orders)
+                orders = []
+
+        
+                cm_bid = (sum(vol * p for p, vol in od.buy_orders.items())
+                          / sum(od.buy_orders.values()))
+                cm_ask = (sum(vol * abs(p) for p, vol in od.sell_orders.items())
+                          / sum(abs(v) for v in od.sell_orders.values()))
+                mid = (cm_bid + cm_ask) / 2
+
+                mid_prices.append((mid, state.timestamp))
+                mid_prices.sort(key=lambda x: x[1])
+                series = pd.Series([x[0] for x in mid_prices])
+
+                
+                window = min(BB_WINDOW, len(series))
+                roll_mean = series.rolling(window).mean().iloc[-1]
+                roll_std  = series.rolling(window).std().iloc[-1]
+
+                if pd.isna(roll_std) or roll_std == 0:
+                    result[prod] = []
+                    continue
+
+                upper_band = roll_mean + BB_STD_MULT * roll_std
+                lower_band = roll_mean - BB_STD_MULT * roll_std
+                band_width = upper_band - lower_band   # squeeze indicator
+
+                #mean reversion anchor
+                ewm_mean  = series.ewm(span=EWM_SPAN).mean().iloc[-1]
+                deviation = mid - ewm_mean   # signed distance from EWM
+
+                # crossover ──
+                fast_ema = series.ewm(span=FAST_SPAN).mean().iloc[-1]
+                slow_ema = series.ewm(span=SLOW_SPAN).mean().iloc[-1]
+                trending_up   = fast_ema > slow_ema
+                trending_down = fast_ema < slow_ema
+
+                # ── RSI ────────────────────────────────────────────────────────
+                if len(mid_prices) > 1:
+                    delta_series = [mid_prices[i][0] - mid_prices[i-1][0]
+                                    for i in range(1, len(mid_prices))]
+                    n = min(RSI_N, len(delta_series))
+                    recent = delta_series[-n:]
+                    avg_g = pd.Series([max(d, 0) for d in recent]).mean()
+                    avg_l = pd.Series([max(-d, 0) for d in recent]).mean()
+                    avg_l = avg_l if avg_l > 0 else 1
+                    RS  = avg_g / avg_l
+                    RSI = 100 - (100 / (1 + RS))
+                else:
+                    RSI = 50  # neutral default
+
+                pos        = state.position.get(prod, 0)
+                buy_room   = POS_LIMIT - pos
+                sell_room  = POS_LIMIT + pos
+                spread     = ba_price - bb_price
+
+               
+                # Mean reversion provides the primary entry signal .
+                # Momentum  confirmation filter.
+                # Entry tiers:
+                #   STRONG  = price outside band + momentum agrees
+                #   MODERATE= price outside band, momentum neutral/mixed
+                #   FADE    = price at band edge, momentum contradicts → skip
+               
+
+                # ── BUY SIGNALS (price at or below lower band) ────────────────
+                if mid <= lower_band:
+                    # Mean reversion says oversold; check momentum before buying
+
+                    if trending_up and RSI < 50:
+                        # STRONG: both signals agree — price recovering
+                        if buy_room > 0:
+                            orders.append(Order(prod, bb_price + 2, min(40, buy_room)))
+                        if sell_room > 0 and spread >= 2:
+                            # Lean ask side lightly while recovering
+                            orders.append(Order(prod, ba_price - 1, -min(10, sell_room)))
+
+                    elif not trending_down and RSI < 60:
+                        # MODERATE: no strong downtrend, likely reversion
+                        if buy_room > 0:
+                            orders.append(Order(prod, bb_price + 1, min(25, buy_room)))
+
+                    elif trending_down and RSI < 30:
+                        # RSI deeply oversold even in downtrend — small contrarian buy
+                        if buy_room > 0:
+                            orders.append(Order(prod, bb_price + 1, min(15, buy_room)))
+                    # else: trending down, RSI not oversold → skip (don't fade strong move)
+
+                # ── SELL SIGNALS (price at or above upper band) ───────────────
+                elif mid >= upper_band:
+                    # Mean reversion says overbought; check momentum before selling
+
+                    if trending_down and RSI > 50:
+                        # STRONG: both signals agree — price rolling over
+                        if sell_room > 0:
+                            orders.append(Order(prod, ba_price - 2, -min(40, sell_room)))
+                        if buy_room > 0 and spread >= 2:
+                            orders.append(Order(prod, bb_price + 1, min(10, buy_room)))
+
+                    elif not trending_up and RSI > 40:
+                        # MODERATE: no strong uptrend, likely reversion
+                        if sell_room > 0:
+                            orders.append(Order(prod, ba_price - 1, -min(25, sell_room)))
+
+                    elif trending_up and RSI > 70:
+                        # RSI deeply overbought even in uptrend — small contrarian sell
+                        if sell_room > 0:
+                            orders.append(Order(prod, ba_price - 1, -min(15, sell_room)))
+                    # else: trending up, RSI not overbought → skip
+
+                # ── INSIDE THE BANDS: passive market-making ───────────────────
+                else:
+                    # Price is between the bands — no directional edge.
+                    # Use EWM deviation to shade the quotes slightly,
+                    # plus momentum to tighten/widen sizing.
+                    #
+                    # If trending up:   lean buy side heavier
+                    # If trending down: lean sell side heavier
+                    # Otherwise:        symmetric MM
+
+                    base_size = 15
+
+                    if trending_up and RSI < 65:
+                        buy_size  = min(base_size + 10, buy_room)
+                        sell_size = min(base_size - 5,  sell_room)
+                    elif trending_down and RSI > 35:
+                        buy_size  = min(base_size - 5,  buy_room)
+                        sell_size = min(base_size + 10, sell_room)
+                    else:
+                        buy_size  = min(base_size, buy_room)
+                        sell_size = min(base_size, sell_room)
+
+                    # Shade quote price by EWM deviation
+                    buy_offset  = 2 if deviation <= -1 else 1
+                    sell_offset = 2 if deviation >=  1 else 1
+
+                    if buy_size  > 0: orders.append(Order(prod, bb_price + buy_offset,   buy_size))
+                    if sell_size > 0: orders.append(Order(prod, ba_price - sell_offset, -sell_size))
+
+                result[prod] = orders
+
+        return result, 0, ""
