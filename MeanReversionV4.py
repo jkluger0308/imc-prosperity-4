@@ -74,7 +74,7 @@ class Trader:
                         orders.append(Order(prod, bb, -round(0.5*sell_room)))
 
                 else:
-                    # |z| < 2.1: Aggressive MM with more buying power 
+                    # |z| < 2: Aggressive MM with more buying power 
                     mm_sz = 35
                     if ba - bb >= 2:
                             if buy_room > 0:
