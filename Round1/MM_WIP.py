@@ -9,7 +9,7 @@ from datamodel import Order, TradingState
 FLAT_THRESHOLD = 35
 FLAT_TARGET    = 15
 BASE           = 24   # was 12 in R1B/R1F
-MULT = 2
+MULT = 1
 
 
 def updatepos(pos: int, vol: int, maxpos: int = 80):
@@ -74,7 +74,8 @@ class Trader:
                 bb = max(pbid_below_fair)
                 ba = min(pask_above_fair)
 
-                pointmid = (ba + bb) / 2
+                #pointmid = (ba + bb) / 2
+                pointmid = VWAP
 
                 alpha = 2 / (5 + 1) # Manual exponentially weighted mean calculation provides lower latency than using Pandas.
                 if osm_ewm is None: 
@@ -153,14 +154,14 @@ class Trader:
                 # ── Layer 3: zero-edge inventory neutralization ───────
                 if pos >= FLAT_THRESHOLD and sell_room > 0:
                     flat_price = int(fairprice)
-                    flat_size  = min(pos - FLAT_TARGET, sell_room)
+                    flat_size = min(pos - FLAT_TARGET, sell_room)
                     if flat_size > 0:
                         orders.append(Order(prod, flat_price, -flat_size))
                         print(f"Order({prod}, {flat_price}, {-flat_size})")
                         pos, buy_room, sell_room = updatepos(pos, -flat_size)
 
                 elif pos <= -FLAT_THRESHOLD and buy_room > 0:
-                    flat_price = int(fairprice) + (1 if fairprice != int(fairprice) else 0)
+                    flat_price = int(fairprice)
                     flat_size  = min(-pos - FLAT_TARGET, buy_room)
                     if flat_size > 0:
                         orders.append(Order(prod, flat_price, flat_size))
