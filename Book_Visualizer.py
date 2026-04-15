@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 import pandas as pd
 
 # -----------------------------------------------------------------------------
@@ -37,7 +38,10 @@ DEFAULT_ROOTS = [SCRIPT_DIR / "backtests", Path.home() / "Downloads"]
 CACHE_DIR = SCRIPT_DIR / ".cache_dashboard"
 GUIDE_PATH = SCRIPT_DIR / "ORDERBOOK_DASHBOARD_GUIDE.md"
 # Bump when parsed book/trade metrics change so stale pickles are not reused.
-PARSED_CACHE_VERSION = "5"
+PARSED_CACHE_VERSION = "11"
+ORDER_PRINT_RE = re.compile(
+    r"Order\(\s*([^,]+?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)"
+)
 
 
 def _load_guide_markdown() -> str:
@@ -231,6 +235,62 @@ def parse_backtester_log(path: Path) -> dict[str, Any]:
     }
 
 
+_OFFICIAL_PRICES_NAME_RE = re.compile(r"^prices_round_(\d+)_day_(-?\d+)\.csv$", re.IGNORECASE)
+
+
+def _looks_like_official_prices_csv(path: Path) -> bool:
+    if path.suffix.lower() != ".csv":
+        return False
+    try:
+        first = path.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+    except OSError:
+        return False
+    return first.startswith("day;timestamp;product")
+
+
+def _sibling_official_trades_csv(prices_path: Path) -> Path | None:
+    m = _OFFICIAL_PRICES_NAME_RE.match(prices_path.name)
+    if not m:
+        return None
+    trades = prices_path.with_name(f"trades_round_{m.group(1)}_day_{m.group(2)}.csv")
+    return trades if trades.is_file() else None
+
+
+def parse_official_round_csv(prices_path: Path) -> dict[str, Any]:
+    """
+    IMC-published round data: ``prices_round_R_day_D.csv`` (+ optional sibling
+    ``trades_round_R_day_D.csv``). Same schema as backtester activities + trade list.
+    """
+    raw_book = prices_path.read_text(encoding="utf-8", errors="replace")
+    book_df = _parse_activities_csv(raw_book)
+
+    trades_df = pd.DataFrame()
+    trades_path = _sibling_official_trades_csv(prices_path)
+    if trades_path is not None:
+        try:
+            trades_df = pd.read_csv(trades_path, sep=";")
+            trades_df.columns = [str(c).strip() for c in trades_df.columns]
+        except Exception:
+            trades_df = pd.DataFrame()
+
+    meta: dict[str, Any] = {}
+    m = _OFFICIAL_PRICES_NAME_RE.match(prices_path.name)
+    if m:
+        meta["round"] = int(m.group(1))
+        meta["day"] = int(m.group(2))
+        meta["status"] = "official_csv"
+
+    return {
+        "book_df": book_df,
+        "trades_df": trades_df,
+        "logs_df": pd.DataFrame(columns=["timestamp", "source", "message"]),
+        "positions_df": pd.DataFrame(),
+        "graphlog_df": pd.DataFrame(),
+        "submission_meta": meta,
+        "source": "official_round_csv",
+    }
+
+
 def _empty_parse_result(source: str) -> dict[str, Any]:
     return {
         "book_df": pd.DataFrame(),
@@ -288,12 +348,13 @@ def _coerce_trades_frame(val: Any) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def parse_fronttest_dict(root: dict[str, Any], source_tag: str = "fronttest_json") -> dict[str, Any]:
-    act = root.get("activitiesLog") or root.get("activities_log")
-    book_df = _parse_activities_csv(act) if isinstance(act, str) else pd.DataFrame()
+def _merge_trade_sources(root: dict[str, Any]) -> pd.DataFrame:
+    """Concatenate every non-empty trade list from front-test JSON (own + market + combined).
 
-    trades_df = pd.DataFrame()
-    for key in (
+    Previously we stopped at the first key with data, so payloads that listed both
+    ``ownTrades`` and ``marketTrades`` only kept own fills and dropped anonymous prints.
+    """
+    keys = (
         "tradeHistory",
         "trade_history",
         "trades",
@@ -301,15 +362,36 @@ def parse_fronttest_dict(root: dict[str, Any], source_tag: str = "fronttest_json
         "own_trades",
         "marketTrades",
         "market_trades",
-    ):
+    )
+    frames: list[pd.DataFrame] = []
+    for key in keys:
         if key not in root or not root[key]:
             continue
         try:
-            trades_df = _coerce_trades_frame(root[key])
+            chunk = _coerce_trades_frame(root[key])
         except Exception:
-            trades_df = pd.DataFrame()
-        if not trades_df.empty:
-            break
+            continue
+        if not chunk.empty:
+            frames.append(chunk)
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    sym = out.get("product", out.get("symbol", pd.Series([""] * len(out))))
+    out = out.copy()
+    out["_dedupe_sym"] = sym.astype(str)
+    # Include buyer/seller when present so two different prints at the same (ts, price, qty)
+    # are not collapsed (e.g. own vs market view of related activity).
+    dedupe_cols = [c for c in ("_dedupe_sym", "timestamp", "price", "quantity", "buyer", "seller") if c in out.columns]
+    if len(dedupe_cols) >= 2:
+        out = out.drop_duplicates(subset=dedupe_cols, keep="first")
+    return out.drop(columns=["_dedupe_sym"], errors="ignore")
+
+
+def parse_fronttest_dict(root: dict[str, Any], source_tag: str = "fronttest_json") -> dict[str, Any]:
+    act = root.get("activitiesLog") or root.get("activities_log")
+    book_df = _parse_activities_csv(act) if isinstance(act, str) else pd.DataFrame()
+
+    trades_df = _merge_trade_sources(root)
 
     logs_rows: list[dict[str, Any]] = []
     for key in ("sandboxLogs", "sandbox_logs", "sandboxLog", "logs"):
@@ -386,6 +468,10 @@ def parse_fronttest_json(path: Path) -> dict[str, Any]:
 def parse_log_file(path: Path) -> dict[str, Any]:
     path = path.resolve()
     suf = path.suffix.lower()
+    if suf == ".csv":
+        if _OFFICIAL_PRICES_NAME_RE.match(path.name) and _looks_like_official_prices_csv(path):
+            return parse_official_round_csv(path)
+        return _empty_parse_result("unsupported_csv")
     if suf == ".json":
         return parse_fronttest_json(path)
     if suf == ".log":
@@ -445,6 +531,16 @@ def normalize_price_series(y: pd.Series, base: pd.Series, mode: str) -> pd.Serie
     return y
 
 
+def ewm_zscore(series: pd.Series, span: int) -> pd.Series:
+    """EWM z-score with variance floor for numeric stability."""
+    s = pd.to_numeric(series, errors="coerce")
+    sp = max(2, int(span))
+    e1 = s.ewm(span=sp, adjust=False).mean()
+    e2 = (s * s).ewm(span=sp, adjust=False).mean()
+    var = (e2 - e1 * e1).clip(lower=1e-9)
+    return (s - e1) / np.sqrt(var)
+
+
 # -----------------------------------------------------------------------------
 # Trade classification & position
 # -----------------------------------------------------------------------------
@@ -475,8 +571,9 @@ def _infer_maker_taker(
     Own (SUBMISSION): passive bid lifted (buy at bid) or passive ask lifted (sell at ask) → M;
     buy at/through ask, sell at/through bid, or inside spread → T.
 
-    Others: print strictly inside the touch → T (aggressive / price improvement);
-    print at or through best bid or ask → M (matches at touch in many tapes where both sides are passive).
+    Others (anonymous): prints at/near best bid or best ask are treated as **passive-touch**
+    fills (**M**); strictly inside the quoted spread are **T**; prices that step through
+    the book (below bid or above ask) are **T**.
     """
     if pd.isna(bb) or pd.isna(ba):
         return "U"
@@ -490,6 +587,11 @@ def _infer_maker_taker(
     tol = _price_touch_tol(bb_f, ba_f, price)
 
     if is_own:
+        # Rare malformed row: both sides SUBMISSION — classify from price vs book only.
+        if buyer_sub and seller_sub:
+            if price <= bb_f + tol or price >= ba_f - tol:
+                return "M"
+            return "T"
         if buyer_sub:
             if price <= bb_f + tol:
                 return "M"
@@ -500,9 +602,14 @@ def _infer_maker_taker(
             return "T"
         return "U"
 
+    # Non-own: through the book → taker; at a touch → maker; between touches → taker.
+    if price < bb_f - tol or price > ba_f + tol:
+        return "T"
+    if price <= bb_f + tol or price >= ba_f - tol:
+        return "M"
     if bb_f + tol < price < ba_f - tol:
         return "T"
-    return "M"
+    return "U"
 
 
 def classify_trades(trades_df: pd.DataFrame, book_df: pd.DataFrame) -> pd.DataFrame:
@@ -510,8 +617,15 @@ def classify_trades(trades_df: pd.DataFrame, book_df: pd.DataFrame) -> pd.DataFr
         return trades_df
     t = trades_df.copy()
     t.columns = [str(c).strip() for c in t.columns]
-    sym = t.get("symbol", t.get("product", pd.Series([""] * len(t))))
-    t["product"] = sym.astype(str)
+    n = len(t)
+    prod_series = pd.Series([""] * n, index=t.index, dtype=str)
+    if "product" in t.columns:
+        prod_series = t["product"].astype(str).fillna("")
+    if "symbol" in t.columns:
+        sym_series = t["symbol"].astype(str).fillna("")
+        use_sym = sym_series.str.strip().ne("") & ~sym_series.str.lower().isin(("nan", "none"))
+        prod_series = sym_series.where(use_sym, prod_series)
+    t["product"] = prod_series.replace({"nan": "", "None": ""}, regex=False)
 
     buyer = t.get("buyer", pd.Series([None] * len(t)))
     seller = t.get("seller", pd.Series([None] * len(t)))
@@ -519,14 +633,24 @@ def classify_trades(trades_df: pd.DataFrame, book_df: pd.DataFrame) -> pd.DataFr
     sell_sub = seller.map(_side_is_submission)
     t["is_own"] = buy_sub | sell_sub
 
-    t["_ts"] = pd.to_numeric(t["timestamp"], errors="coerce")
+    if "timestamp" not in t.columns:
+        t["role"] = "U"
+        if "quantity" in t.columns:
+            t["qty_abs"] = pd.to_numeric(t["quantity"], errors="coerce").fillna(0.0).abs()
+        else:
+            t["qty_abs"] = 0.0
+        t["size_bucket"] = "S"
+        return t
+
+    t["_ts"] = pd.to_numeric(t["timestamp"], errors="coerce").astype("float64")
     t["_price"] = pd.to_numeric(t.get("price", 0), errors="coerce")
 
-    if book_df.empty:
+    if book_df.empty or "bid_price_1" not in book_df.columns or "ask_price_1" not in book_df.columns:
         t["role"] = "U"
+        t = t.drop(columns=["_ts", "_price"], errors="ignore")
     else:
         b = book_df.copy()
-        b["_ts"] = pd.to_numeric(b["timestamp"], errors="coerce")
+        b["_ts"] = pd.to_numeric(b["timestamp"], errors="coerce").astype("float64")
         b["product"] = b["product"].astype(str)
         book_side = b[["_ts", "product", "bid_price_1", "ask_price_1"]].dropna(subset=["_ts"])
         book_side = book_side.sort_values(["product", "_ts"])
@@ -561,7 +685,7 @@ def classify_trades(trades_df: pd.DataFrame, book_df: pd.DataFrame) -> pd.DataFr
             parts.append(mg)
 
         merged = pd.concat(parts, ignore_index=True)
-        merged = merged.drop(columns=["_ts", "_price"], errors="ignore")
+        merged = merged.drop(columns=["_ts", "_price", "_bb", "_ba"], errors="ignore")
         t = merged
 
     # size bucket by product quantiles (own trades included for quantiles)
@@ -631,19 +755,22 @@ def build_main_figure(
     x_range: Optional[tuple[float, float]] = None,
     overlay_metrics: Optional[list[str]] = None,
     size_buckets: Optional[list[str]] = None,
+    zscore_span: int = 20,
+    order_audit_df: Optional[pd.DataFrame] = None,
 ) -> go.Figure:
-    b = book[book["product"].astype(str) == product].copy()
-    if b.empty:
+    b_full = book[book["product"].astype(str) == product].copy()
+    if b_full.empty:
         fig = go.Figure()
         fig.update_layout(title="No book data for product", template="plotly_dark")
         return fig
 
     if x_range:
         lo, hi = x_range
-        b = b[(b["timestamp"] >= lo) & (b["timestamp"] <= hi)]
+        b_full = b_full[(b_full["timestamp"] >= lo) & (b_full["timestamp"] <= hi)]
 
-    b = thin_series(b.sort_values("timestamp"), "timestamp", max_points)
-    b = add_book_metrics(b)
+    b_full = b_full.sort_values("timestamp")
+    b_full = add_book_metrics(b_full)
+    b = thin_series(b_full.copy(), "timestamp", max_points)
 
     base_col = norm_base if norm_base in b.columns else "wallmid"
     base_s = b[base_col] if base_col in b.columns else pd.Series(0.0, index=b.index)
@@ -684,7 +811,7 @@ def build_main_figure(
                 x=b["timestamp"],
                 y=yw,
                 mode="lines",
-                name="WallMid",
+                name="WallMid (min bid L1–3 + max ask L1–3) / 2",
                 line=dict(color="white", width=1, dash="dot"),
             )
         )
@@ -695,7 +822,7 @@ def build_main_figure(
                 x=b["timestamp"],
                 y=ym,
                 mode="lines",
-                name="Touch mid",
+                name="Touch mid (best bid + best ask) / 2",
                 line=dict(color="cyan", width=1),
             )
         )
@@ -703,7 +830,9 @@ def build_main_figure(
     om = overlay_metrics or []
     has_spread = "spread" in om and "spread" in b.columns
     has_imb = "imbalance" in om and "imbalance" in b.columns
+    has_z = "zscore" in om
     use_y2 = has_spread or has_imb
+    use_y3 = False
     if has_spread:
         fig.add_trace(
             go.Scattergl(
@@ -726,6 +855,107 @@ def build_main_figure(
                 yaxis="y2",
             )
         )
+    if has_z:
+        z_base_col = "mid_touch" if "mid_touch" in b.columns else ("wallmid" if "wallmid" in b.columns else "mid_price")
+        if z_base_col in b.columns:
+            z_s = ewm_zscore(b[z_base_col], zscore_span)
+            fig.add_trace(
+                go.Scattergl(
+                    x=b["timestamp"],
+                    y=z_s,
+                    mode="lines",
+                    name=f"Z-score ({z_base_col}, span={max(2, int(zscore_span))})",
+                    line=dict(color="deepskyblue", width=1.25),
+                    yaxis="y3",
+                )
+            )
+            use_y3 = True
+
+    # Placed-order audit overlays (derived from sandbox/lambda Order(...) prints + SUBMISSION fills)
+    # Show only problematic placed intents by default: unfilled / partial.
+    if order_audit_df is not None and not order_audit_df.empty:
+        oa = order_audit_df.copy()
+        oa = oa[oa["product"].astype(str) == str(product)]
+        if not oa.empty:
+            oa["timestamp"] = pd.to_numeric(oa["timestamp"], errors="coerce")
+            oa["price"] = pd.to_numeric(oa["price"], errors="coerce")
+            oa = oa.dropna(subset=["timestamp", "price"])
+            if x_range:
+                lo, hi = x_range
+                oa = oa[(oa["timestamp"] >= lo) & (oa["timestamp"] <= hi)]
+            if not oa.empty:
+                oa = thin_series(oa.sort_values("timestamp"), "timestamp", max(300, min(7000, max_points // 3)))
+
+                # Normalize overlay y values to current display mode.
+                if norm_mode == "none":
+                    oa["yp"] = oa["price"]
+                else:
+                    if not b_full.empty and base_col in b_full.columns:
+                        base_df = (
+                            b_full[["timestamp", base_col]]
+                            .dropna(subset=[base_col])
+                            .assign(timestamp=lambda d: pd.to_numeric(d["timestamp"], errors="coerce").astype("float64"))
+                            .dropna(subset=["timestamp"])
+                            .sort_values("timestamp")
+                            .drop_duplicates("timestamp", keep="last")
+                        )
+                        oa = oa.sort_values("timestamp")
+                        oa = pd.merge_asof(
+                            oa,
+                            base_df.rename(columns={base_col: "_base"}),
+                            on="timestamp",
+                            direction="nearest",
+                        )
+                    else:
+                        oa["_base"] = 0.0
+
+                    if norm_mode == "subtract":
+                        oa["yp"] = oa["price"] - oa["_base"].fillna(0)
+                    else:
+                        d = oa["price"] - oa["_base"].fillna(0)
+                        zstd = 1.0
+                        if base_col in b_full.columns:
+                            ref_series = None
+                            if "mid_touch" in b_full.columns:
+                                ref_series = pd.to_numeric(b_full["mid_touch"], errors="coerce") - pd.to_numeric(
+                                    b_full[base_col], errors="coerce"
+                                )
+                            elif "bid_price_1" in b_full.columns:
+                                ref_series = pd.to_numeric(b_full["bid_price_1"], errors="coerce") - pd.to_numeric(
+                                    b_full[base_col], errors="coerce"
+                                )
+                            if ref_series is not None and ref_series.notna().sum() > 1:
+                                zstd = float(ref_series.std())
+                        if zstd < 1e-12:
+                            zstd = float(d.std()) if len(d) > 1 else 1.0
+                        if zstd < 1e-12:
+                            zstd = 1.0
+                        oa["yp"] = d / zstd
+
+                # Highlight missing/partial fills from placed intents.
+                audit_specs: list[tuple[str, str, str, str]] = [
+                    ("unfilled", "circle-open", "red", "Placed order (unfilled)"),
+                    ("partial", "diamond-open", "orange", "Placed order (partial fill)"),
+                ]
+                for st, sym, col, name in audit_specs:
+                    sub = oa[oa["status"].astype(str) == st]
+                    if sub.empty:
+                        continue
+                    fig.add_trace(
+                        go.Scattergl(
+                            x=sub["timestamp"],
+                            y=sub["yp"],
+                            mode="markers",
+                            name=name,
+                            marker=dict(size=10, symbol=sym, color=col, line=dict(width=1.2, color=col)),
+                            customdata=sub[["price", "placed_abs", "filled_abs", "unfilled_abs", "side"]].values,
+                            hovertemplate=(
+                                "price=%{customdata[0]} side=%{customdata[4]} "
+                                "placed=%{customdata[1]} filled=%{customdata[2]} unfilled=%{customdata[3]}"
+                                "<extra></extra>"
+                            ),
+                        )
+                    )
 
     if not trades.empty and "product" in trades.columns and "timestamp" in trades.columns and "price" in trades.columns:
         tr = trades[trades["product"].astype(str) == product].copy()
@@ -749,7 +979,13 @@ def build_main_figure(
             own = bool(row.get("is_own", False))
             r = str(row.get("role", "U"))
             if own:
-                return bool(trade_filters.get("F", True))
+                if trade_filters.get("F", True):
+                    return True
+                if r == "M" and trade_filters.get("M", True):
+                    return True
+                if r == "T" and trade_filters.get("T", True):
+                    return True
+                return False
             if r == "M":
                 return bool(trade_filters.get("M", True))
             if r == "T":
@@ -765,10 +1001,25 @@ def build_main_figure(
 
         tr = thin_series(tr.sort_values("timestamp"), "timestamp", max(400, min(8000, max_points // 2)))
 
-        # Map trade price y: need normalization base at timestamp — merge_asof
-        if not b.empty and base_col in b.columns:
-            base_df = b[["timestamp", base_col]].dropna().sort_values("timestamp")
-            tr = tr.sort_values("timestamp")
+        # Align each trade to the book row baseline (use full-resolution book — not thinned —
+        # so merge_asof "nearest" is not pulled to a sparse/downsampled grid).
+        if not b_full.empty and base_col in b_full.columns:
+            base_df = (
+                b_full[["timestamp", base_col]]
+                .dropna(subset=[base_col])
+                .assign(
+                    timestamp=lambda d: pd.to_numeric(d["timestamp"], errors="coerce").astype("float64")
+                )
+                .dropna(subset=["timestamp"])
+                .sort_values("timestamp")
+                .drop_duplicates("timestamp", keep="last")
+            )
+            tr = (
+                tr.assign(
+                    timestamp=lambda d: pd.to_numeric(d["timestamp"], errors="coerce").astype("float64")
+                )
+                .sort_values("timestamp")
+            )
             merged = pd.merge_asof(
                 tr,
                 base_df.rename(columns={base_col: "_base"}),
@@ -786,8 +1037,24 @@ def build_main_figure(
             merged["yp"] = price - merged["_base"].fillna(0)
         else:
             d = price - merged["_base"].fillna(0)
-            s = float(d.std()) if len(d) > 1 else 1.0
-            merged["yp"] = d / s if s > 1e-12 else d * 0.0
+            zstd = 1.0
+            if base_col in b_full.columns:
+                ref_series = None
+                if "mid_touch" in b_full.columns:
+                    ref_series = pd.to_numeric(b_full["mid_touch"], errors="coerce") - pd.to_numeric(
+                        b_full[base_col], errors="coerce"
+                    )
+                elif "bid_price_1" in b_full.columns:
+                    ref_series = pd.to_numeric(b_full["bid_price_1"], errors="coerce") - pd.to_numeric(
+                        b_full[base_col], errors="coerce"
+                    )
+                if ref_series is not None and ref_series.notna().sum() > 1:
+                    zstd = float(ref_series.std())
+            if zstd < 1e-12:
+                zstd = float(d.std()) if len(d) > 1 else 1.0
+            if zstd < 1e-12:
+                zstd = 1.0
+            merged["yp"] = d / zstd
 
         for col in ("price", "quantity", "buyer", "seller"):
             if col not in merged.columns:
@@ -795,6 +1062,7 @@ def build_main_figure(
 
         if "is_own" not in merged.columns:
             merged["is_own"] = False
+        merged["is_own"] = merged["is_own"].fillna(False).astype(bool)
 
         trace_specs: list[tuple[bool, str, str, str, str]] = [
             (True, "M", "x", "yellow", "Own maker (SUBMISSION)"),
@@ -819,11 +1087,29 @@ def build_main_figure(
                 )
             )
 
-    ytitle = "Price" if norm_mode == "none" else f"Price ({norm_mode} vs {norm_base})"
+    if norm_mode == "none":
+        ytitle = "Price (absolute)"
+    elif norm_mode == "subtract":
+        ytitle = f"Price − {norm_base} (deviation; Prosperity prices are ints ≈ ticks)"
+    else:
+        ytitle = f"Z-score of (price − {norm_base})"
+
+    title_main = f"Order book + trades — {product}"
+    title_obj: dict[str, Any] = dict(text=title_main)
+    if norm_mode == "subtract":
+        title_obj["subtitle"] = dict(
+            text=(
+                "WallMid is the midpoint of the deepest bid and highest ask across L1–L3, "
+                "not the touch. Best bid/ask can both lie above or below WallMid when depth is skewed. "
+                f"Blue/red markers are bid_price_i / ask_price_i minus {norm_base}."
+            ),
+            font=dict(size=11),
+        )
+
     layout: dict[str, Any] = dict(
         template="plotly_dark",
-        height=520,
-        title=f"Order book + trades — {product}",
+        height=560 if norm_mode == "subtract" else 520,
+        title=title_obj,
         xaxis_title="Timestamp",
         yaxis_title=ytitle,
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
@@ -835,6 +1121,28 @@ def build_main_figure(
             overlaying="y",
             side="right",
             showgrid=False,
+        )
+    if use_y3:
+        z_max = 3.0
+        for tr in fig.data:
+            if getattr(tr, "yaxis", None) == "y3":
+                y = pd.to_numeric(pd.Series(tr["y"]), errors="coerce")
+                if not y.empty:
+                    y_abs = np.abs(y.values.astype(float))
+                    y_abs = y_abs[np.isfinite(y_abs)]
+                    if y_abs.size:
+                        z_max = max(z_max, float(y_abs.max()))
+        z_max = float(max(1.0, min(20.0, z_max * 1.05)))
+        layout["yaxis3"] = dict(
+            title="Z-score",
+            overlaying="y",
+            side="right",
+            anchor="free",
+            position=1.0 if not use_y2 else 0.94,
+            showgrid=False,
+            zeroline=True,
+            zerolinecolor="deepskyblue",
+            range=[-z_max, z_max],
         )
     fig.update_layout(**layout)
     if x_range:
@@ -984,6 +1292,8 @@ def _format_submission_meta(meta: dict[str, Any]) -> str:
         parts.append(f"**Status:** {meta['status']}")
     if meta.get("round") is not None:
         parts.append(f"**Round:** {meta['round']}")
+    if meta.get("day") is not None:
+        parts.append(f"**Day:** {meta['day']}")
     sid = meta.get("submissionId") or meta.get("submission_id")
     if sid:
         parts.append(f"**Submission:** `{sid}`")
@@ -1006,6 +1316,182 @@ def logs_at_hover(logs_df: pd.DataFrame, ts: Optional[float], window: int = 500)
         ts_show = int(r["_tsn"]) if pd.notna(r["_tsn"]) else r["timestamp"]
         lines.append(f"**{ts_show}** [{r.get('source','')}] {r.get('message','')}")
     return "\n\n".join(lines[:80])
+
+
+def _side_from_qty(qty: float) -> str:
+    return "BUY" if qty > 0 else "SELL"
+
+
+def parse_placed_orders_from_logs(logs_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Parse sandbox print lines like: Order(PROD, 10001, -7)
+    Returns one row per parsed order intent.
+    """
+    if logs_df.empty or "message" not in logs_df.columns:
+        return pd.DataFrame(columns=["timestamp", "product", "price", "qty", "side", "placed_abs"])
+
+    rows: list[dict[str, Any]] = []
+    tsn = pd.to_numeric(logs_df.get("timestamp", pd.Series([], dtype=float)), errors="coerce")
+    for i, msg in enumerate(logs_df["message"].astype(str)):
+        tsv = tsn.iloc[i] if i < len(tsn) else float("nan")
+        if pd.isna(tsv):
+            continue
+        for m in ORDER_PRINT_RE.finditer(msg):
+            prod = str(m.group(1)).strip().strip("'\"")
+            try:
+                price = int(round(float(m.group(2))))
+                qty = int(round(float(m.group(3))))
+            except (TypeError, ValueError):
+                continue
+            if qty == 0:
+                continue
+            rows.append(
+                {
+                    "timestamp": float(tsv),
+                    "product": prod,
+                    "price": price,
+                    "qty": qty,
+                    "side": _side_from_qty(float(qty)),
+                    "placed_abs": abs(qty),
+                }
+            )
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["timestamp", "product", "price", "qty", "side", "placed_abs"])
+
+
+def own_fills_summary(trades_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate SUBMISSION fills by (timestamp, product, price, side).
+    side=BUY when SUBMISSION buyer; side=SELL when SUBMISSION seller.
+    """
+    if trades_df.empty:
+        return pd.DataFrame(columns=["timestamp", "product", "price", "side", "filled_abs"])
+    t = trades_df.copy()
+    if "product" not in t.columns and "symbol" in t.columns:
+        t["product"] = t["symbol"]
+    need = {"timestamp", "price", "quantity", "buyer", "seller", "product"}
+    if any(c not in t.columns for c in need):
+        return pd.DataFrame(columns=["timestamp", "product", "price", "side", "filled_abs"])
+
+    t["timestamp"] = pd.to_numeric(t["timestamp"], errors="coerce")
+    t["price"] = pd.to_numeric(t["price"], errors="coerce")
+    t["quantity"] = pd.to_numeric(t["quantity"], errors="coerce").abs()
+    t = t.dropna(subset=["timestamp", "price", "quantity"])
+    if t.empty:
+        return pd.DataFrame(columns=["timestamp", "product", "price", "side", "filled_abs"])
+
+    buy_sub = t["buyer"].astype(str).str.upper().eq("SUBMISSION")
+    sell_sub = t["seller"].astype(str).str.upper().eq("SUBMISSION")
+    t = t[buy_sub | sell_sub].copy()
+    if t.empty:
+        return pd.DataFrame(columns=["timestamp", "product", "price", "side", "filled_abs"])
+    t["side"] = np.where(buy_sub.loc[t.index], "BUY", "SELL")
+    t["product"] = t["product"].astype(str)
+    t["price"] = t["price"].astype(int)
+
+    g = (
+        t.groupby(["timestamp", "product", "price", "side"], as_index=False)["quantity"]
+        .sum()
+        .rename(columns={"quantity": "filled_abs"})
+    )
+    return g
+
+
+def build_order_fill_audit_df(
+    logs_df: pd.DataFrame,
+    trades_df: pd.DataFrame,
+    product: Optional[str] = None,
+) -> pd.DataFrame:
+    placed = parse_placed_orders_from_logs(logs_df)
+    fills = own_fills_summary(trades_df)
+
+    if product and product != "NONE":
+        if not placed.empty:
+            placed = placed[placed["product"].astype(str) == str(product)]
+        if not fills.empty:
+            fills = fills[fills["product"].astype(str) == str(product)]
+
+    if not placed.empty:
+        p = placed.groupby(["timestamp", "product", "price", "side"], as_index=False)["placed_abs"].sum()
+    else:
+        p = pd.DataFrame(columns=["timestamp", "product", "price", "side", "placed_abs"])
+    if not fills.empty:
+        f = fills.copy()
+    else:
+        f = pd.DataFrame(columns=["timestamp", "product", "price", "side", "filled_abs"])
+
+    merged = pd.merge(
+        p,
+        f,
+        on=["timestamp", "product", "price", "side"],
+        how="outer",
+    )
+    if merged.empty:
+        return merged
+    merged["placed_abs"] = pd.to_numeric(merged["placed_abs"], errors="coerce")
+    merged["filled_abs"] = pd.to_numeric(merged["filled_abs"], errors="coerce").fillna(0.0)
+    has_placed = merged["placed_abs"].notna()
+    merged["unfilled_abs"] = np.where(has_placed, np.maximum(merged["placed_abs"] - merged["filled_abs"], 0.0), np.nan)
+    merged["status"] = np.where(
+        ~has_placed & (merged["filled_abs"] > 0),
+        "fill-only",
+        np.where(
+            merged["filled_abs"] <= 0,
+            "unfilled",
+            np.where(merged["filled_abs"] < merged["placed_abs"], "partial", "filled"),
+        ),
+    )
+    return merged
+
+
+def build_order_fill_audit_markdown(
+    logs_df: pd.DataFrame,
+    trades_df: pd.DataFrame,
+    ts: Optional[float],
+    product: Optional[str] = None,
+) -> str:
+    merged = build_order_fill_audit_df(logs_df, trades_df, product)
+    if merged.empty:
+        return "### Order/Fills Audit\n_No parsed placed orders or SUBMISSION fills in file._"
+
+    p = merged[merged["placed_abs"].notna()].copy()
+    f = merged[merged["filled_abs"] > 0].copy()
+
+    sub = merged
+    if ts is not None:
+        t0 = float(ts)
+        sub = merged[np.isclose(pd.to_numeric(merged["timestamp"], errors="coerce"), t0)]
+    if sub.empty:
+        sub = merged.sort_values("timestamp", ascending=False).head(25)
+        scope = "latest rows"
+    else:
+        scope = f"timestamp={int(float(ts)) if ts is not None else 'n/a'}"
+
+    sub = sub.sort_values(["timestamp", "product", "price", "side"])
+    placed_tot = int(round(float(p["placed_abs"].sum()))) if not p.empty else 0
+    fills_tot = int(round(float(f["filled_abs"].sum()))) if not f.empty else 0
+    title = "### Order/Fills Audit"
+    if product and product != "NONE":
+        title += f" — {product}"
+    lines = [
+        title,
+        f"_Scope: {scope}. Hover a point to inspect that timestamp._",
+        f"_Totals in scope file/product: placed={placed_tot}, filled={fills_tot}, unmatched={max(placed_tot - fills_tot, 0)}_",
+        "",
+        "| ts | product | side | price | placed | filled | unfilled | status |",
+        "|---:|---|:---:|---:|---:|---:|---:|---|",
+    ]
+    for _, r in sub.iterrows():
+        ts_show = int(float(r["timestamp"])) if pd.notna(r["timestamp"]) else ""
+        placed_show = "-" if pd.isna(r["placed_abs"]) else str(int(round(float(r["placed_abs"]))))
+        filled_show = str(int(round(float(r["filled_abs"])))) if pd.notna(r["filled_abs"]) else "0"
+        unfilled_show = "-" if pd.isna(r["unfilled_abs"]) else str(int(round(float(r["unfilled_abs"]))))
+        lines.append(
+            f"| {ts_show} | {str(r['product'])} | {str(r['side'])} | {int(float(r['price']))} | {placed_show} | {filled_show} | {unfilled_show} | {str(r['status'])} |"
+        )
+
+    if p.empty:
+        lines += ["", "_No `Order(...)` print lines parsed from sandbox/lambda logs; showing fill-only rows where available._"]
+    return "\n".join(lines)
 
 
 # -----------------------------------------------------------------------------
@@ -1046,7 +1532,7 @@ def discover_log_files(roots: list[Path]) -> list[dict]:
         root = root.expanduser().resolve()
         if not root.exists():
             continue
-        for pat in ("**/*.log", "**/*.json"):
+        for pat in ("**/*.log", "**/*.json", "**/prices_round_*_day_*.csv"):
             for p in root.glob(pat):
                 if ".cache" in str(p):
                     continue
@@ -1057,6 +1543,9 @@ def discover_log_files(roots: list[Path]) -> list[dict]:
                     continue
                 if p.suffix.lower() == ".log" and not _looks_like_prosperity_log(p):
                     continue
+                if p.suffix.lower() == ".csv":
+                    if not _OFFICIAL_PRICES_NAME_RE.match(p.name) or not _looks_like_official_prices_csv(p):
+                        continue
                 opts.append({"label": str(p.relative_to(root)) + f" @ {root.name}", "value": str(p)})
     # de-dupe by value
     seen = set()
@@ -1179,10 +1668,13 @@ def create_app(roots: list[Path]) -> Dash:
                         options=[
                             {"label": "Spread", "value": "spread"},
                             {"label": "Imbalance", "value": "imbalance"},
+                            {"label": "Z-score", "value": "zscore"},
                         ],
                         value=[],
                         inline=True,
                     ),
+                    html.Label("Z-score span"),
+                    dcc.Input(id="zscore-span", type="number", min=2, step=1, value=20, style={"width": "90px"}),
                     html.Label("Size buckets"),
                     dcc.Checklist(
                         id="size-bucket-cl",
@@ -1260,11 +1752,14 @@ def create_app(roots: list[Path]) -> Dash:
         d = load_parsed(store["path"], use_cache=True)
         df = d.get("book_df", pd.DataFrame())
         pos = d.get("positions_df", pd.DataFrame())
+        tr = d.get("trades_df", pd.DataFrame())
         prod_set: set[str] = set()
         if not df.empty and "product" in df.columns:
             prod_set |= set(df["product"].astype(str).unique())
         if not pos.empty and "product" in pos.columns:
             prod_set |= {p for p in pos["product"].astype(str).unique() if p and str(p) != "nan"}
+        if not tr.empty and "product" in tr.columns:
+            prod_set |= {p for p in tr["product"].astype(str).unique() if p and str(p) not in ("", "nan")}
         if not prod_set:
             return [{"label": "NONE", "value": "NONE"}], "NONE"
         prods = sorted(prod_set)
@@ -1288,6 +1783,7 @@ def create_app(roots: list[Path]) -> Dash:
         Input("qty-max", "value"),
         Input("max-points", "value"),
         Input("overlay-cl", "value"),
+        Input("zscore-span", "value"),
         Input("size-bucket-cl", "value"),
         Input("main-graph", "hoverData"),
         State("viewport-store", "data"),
@@ -1303,6 +1799,7 @@ def create_app(roots: list[Path]) -> Dash:
         qty_max,
         max_pts,
         overlay_vals,
+        zscore_span,
         size_buckets,
         hover,
         viewport,
@@ -1334,7 +1831,9 @@ def create_app(roots: list[Path]) -> Dash:
             x_range = (float(viewport["x0"]), float(viewport["x1"]))
 
         overlays = [str(x) for x in (overlay_vals or [])]
+        zsp = int(zscore_span) if zscore_span else 20
         buckets = [str(x) for x in (size_buckets or ["S", "B"])]
+        audit_df = build_order_fill_audit_df(logs, trades, product)
         main = build_main_figure(
             book,
             trades,
@@ -1349,6 +1848,8 @@ def create_app(roots: list[Path]) -> Dash:
             x_range=x_range,
             overlay_metrics=overlays,
             size_buckets=buckets if buckets else None,
+            zscore_span=max(2, zsp),
+            order_audit_df=audit_df,
         )
         main.update_layout(uirevision=f"{store.get('path')}:{product}")
         pnl = build_pnl_figure(book, product)
@@ -1363,6 +1864,8 @@ def create_app(roots: list[Path]) -> Dash:
         if hover and "points" in hover and hover["points"]:
             ts = hover["points"][0].get("x")
         log_text = logs_at_hover(logs, ts)
+        audit_text = build_order_fill_audit_markdown(logs, trades, ts, product)
+        log_text = f"{log_text}\n\n---\n\n{audit_text}"
         return main, pnl, pos, log_text, tot_pnl, meta_md
 
     return app
@@ -1370,7 +1873,11 @@ def create_app(roots: list[Path]) -> Dash:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="IMC Prosperity order book dashboard")
-    ap.add_argument("--root", action="append", help="Root folder to scan for .log/.json (repeatable)")
+    ap.add_argument(
+        "--root",
+        action="append",
+        help="Root folder to scan for .log/.json/official prices_round_*_day_*.csv (repeatable)",
+    )
     ap.add_argument("--port", type=int, default=8050)
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
