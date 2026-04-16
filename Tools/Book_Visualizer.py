@@ -4,6 +4,7 @@ IMC Prosperity order-book dashboard: parse backtester / front-test logs and expl
 microstructure (book, trades, PnL, position, logs) interactively.
 
 Run:  python orderbook_dashboard.py [--root PATH] [--port 8050]
+If the port is busy, the next free port is used (see --port-search).
 See ORDERBOOK_DASHBOARD_GUIDE.md for how to read the visualization.
 """
 from __future__ import annotations
@@ -13,6 +14,7 @@ import hashlib
 import json
 import pickle
 import re
+import socket
 from pathlib import Path
 from typing import Any, Optional
 
@@ -512,6 +514,8 @@ def add_book_metrics(df: pd.DataFrame) -> pd.DataFrame:
     bv = out.reindex(columns=BID_V).fillna(0).sum(axis=1)
     av = out.reindex(columns=ASK_V).fillna(0).abs().sum(axis=1)
     out["imbalance"] = bv - av
+    den = bv + av
+    out["imbalance_ratio"] = ((bv - av) / den).where(den.abs() > 1e-9, 0.0)
     out["spread"] = out["best_ask"] - out["best_bid"]
     return out
 
@@ -829,9 +833,9 @@ def build_main_figure(
 
     om = overlay_metrics or []
     has_spread = "spread" in om and "spread" in b.columns
-    has_imb = "imbalance" in om and "imbalance" in b.columns
+    has_imb = "imbalance" in om and "imbalance_ratio" in b.columns
     has_z = "zscore" in om
-    use_y2 = has_spread or has_imb
+    use_y2 = has_spread
     use_y3 = False
     if has_spread:
         fig.add_trace(
@@ -848,13 +852,14 @@ def build_main_figure(
         fig.add_trace(
             go.Scattergl(
                 x=b["timestamp"],
-                y=b["imbalance"],
+                y=b["imbalance_ratio"],
                 mode="lines",
-                name="Imbalance (bid−ask vol)",
-                line=dict(color="magenta", width=1),
-                yaxis="y2",
+                name="Vol imbalance (bid−ask)/(bid+ask)",
+                line=dict(color="magenta", width=1.25),
+                yaxis="y3",
             )
         )
+        use_y3 = True
     if has_z:
         z_base_col = "mid_touch" if "mid_touch" in b.columns else ("wallmid" if "wallmid" in b.columns else "mid_price")
         if z_base_col in b.columns:
@@ -1117,7 +1122,7 @@ def build_main_figure(
     )
     if use_y2:
         layout["yaxis2"] = dict(
-            title="Spread / imbalance",
+            title="Spread (ticks)",
             overlaying="y",
             side="right",
             showgrid=False,
@@ -1133,8 +1138,14 @@ def build_main_figure(
                     if y_abs.size:
                         z_max = max(z_max, float(y_abs.max()))
         z_max = float(max(1.0, min(20.0, z_max * 1.05)))
+        if has_z and has_imb:
+            y3_title = "Z-score & vol imbalance (norm)"
+        elif has_z:
+            y3_title = "Z-score"
+        else:
+            y3_title = "Vol imbalance (norm)"
         layout["yaxis3"] = dict(
-            title="Z-score",
+            title=y3_title,
             overlaying="y",
             side="right",
             anchor="free",
@@ -1667,7 +1678,7 @@ def create_app(roots: list[Path]) -> Dash:
                         id="overlay-cl",
                         options=[
                             {"label": "Spread", "value": "spread"},
-                            {"label": "Imbalance", "value": "imbalance"},
+                            {"label": "Vol imbalance (norm)", "value": "imbalance"},
                             {"label": "Z-score", "value": "zscore"},
                         ],
                         value=[],
@@ -1871,6 +1882,36 @@ def create_app(roots: list[Path]) -> Dash:
     return app
 
 
+def _resolve_listening_port(
+    preferred: int,
+    host: str = "127.0.0.1",
+    *,
+    max_tries: int = 64,
+) -> int:
+    """Return a TCP port we can bind on ``host``, starting at ``preferred``.
+
+    If ``preferred`` is 0, the OS assigns a free ephemeral port.
+    Otherwise try ``preferred``, ``preferred + 1``, ... up to ``max_tries`` attempts.
+    """
+    if preferred < 0:
+        raise ValueError("port must be >= 0")
+    if preferred == 0:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((host, 0))
+            return int(s.getsockname()[1])
+    last_err: OSError | None = None
+    for p in range(preferred, preferred + max_tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((host, p))
+            except OSError as e:
+                last_err = e
+                continue
+            return p
+    assert last_err is not None
+    raise last_err
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="IMC Prosperity order book dashboard")
     ap.add_argument(
@@ -1878,12 +1919,31 @@ def main() -> None:
         action="append",
         help="Root folder to scan for .log/.json/official prices_round_*_day_*.csv (repeatable)",
     )
-    ap.add_argument("--port", type=int, default=8050)
+    ap.add_argument("--port", type=int, default=8050, help="Listen port (0 = OS picks a port)")
+    ap.add_argument(
+        "--port-search",
+        type=int,
+        metavar="N",
+        default=64,
+        help="If the requested port is busy, try up to N successive ports (default: 64). Use 1 to fail fast.",
+    )
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
     roots = [Path(p) for p in args.root] if args.root else DEFAULT_ROOTS
     app = create_app(roots)
-    app.run(debug=args.debug, port=args.port)
+    preferred = args.port
+    if preferred == 0:
+        port = _resolve_listening_port(0)
+    else:
+        port = _resolve_listening_port(preferred, max_tries=max(1, args.port_search))
+    if port != preferred:
+        print(
+            f"Port {preferred} in use; serving on http://127.0.0.1:{port}/",
+            flush=True,
+        )
+    elif preferred == 0:
+        print(f"Dash on http://127.0.0.1:{port}/", flush=True)
+    app.run(debug=args.debug, port=port)
 
 
 if __name__ == "__main__":
