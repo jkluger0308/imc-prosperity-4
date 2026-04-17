@@ -4,16 +4,51 @@ import re
 import numpy as np
 from scipy.stats import norm
 
-# Generate a population of players (e.g. 10,000) drawn from a normal distribution
-N = 5538
-mean, std = 35, 8  # adjust to taste
-population = np.clip(np.random.normal(mean, std, N), 0, 100)
+def generate_population(N=5538):
+    components = []
+
+    # 1. Naive equal-splitters: dump at 33 (1/3 each)
+    components.append(np.random.normal(33, 2, int(N * 0.12)))
+
+    # 2. Classic 50/50 thinkers: split budget two ways, leave speed at 50
+    components.append(np.random.normal(50, 2, int(N * 0.10)))
+
+    # 3. Two-thirds/one-third splitters: 67 and 66
+    components.append(np.random.normal(67, 2, int(N * 0.06)))
+    components.append(np.random.normal(66, 2, int(N * 0.04)))
+
+    # 4. Bulk of players: right-skewed, undervalue speed
+    components.append(np.clip(np.random.normal(30, 18, int(N * 0.25)), 0, 100))
+
+    # 5. Sophisticates who race to the top on speed
+    components.append(np.clip(np.random.normal(75, 10, int(N * 0.15)), 0, 100))
+
+    # 6. Players who ignore speed entirely
+    components.append(np.clip(np.random.normal(10, 8, int(N * 0.10)), 0, 100))
+
+    # 7. Round number spikes at 0/5 endings
+    round_numbers = [20, 25, 30, 35, 40, 45, 55, 60, 65, 70, 75, 80]
+    for r in round_numbers:
+        components.append(np.random.normal(r, 1.2, int(N * 0.005)))
+
+    # 8. Tiny compensator spikes at X+1 and X-1 next to each round number
+    compensators = [r + offset for r in [20,25,30,35,40,45,50,55,60,65,70,75,80]
+                                for offset in [1, -1]]
+    for c in compensators:
+        components.append(np.random.normal(c, 0.8, int(N * 0.001)))
+
+    # 9. "Just under 100" crowd — people maxing speed
+    components.append(np.clip(np.random.normal(95, 3, int(N * 0.04)), 0, 100))
+
+    population = np.clip(np.concatenate(components), 0, 100)
+    return population
+
+population = generate_population(N=5538)
 
 def speed_multiplier(z, population):
-    """Given your investment z, return the hit rate multiplier based on rank in population."""
-    rank = np.sum(population > z)  # number of players beating you
-    percentile = 1 - (rank / len(population))  # 0 = worst, 1 = best
-    return 0.1 + 0.8 * percentile  # scale to [0.1, 0.9]
+    rank = np.sum(population > z)
+    percentile = 1 - (rank / len(population))
+    return 0.1 + 0.8 * percentile
 
 BUDGET = 50000
 
