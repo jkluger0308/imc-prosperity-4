@@ -5,6 +5,9 @@ FLAT_THRESHOLD = 50
 FLAT_TARGET    = 30
 BASE           = 24  
 EMA_ALPHA = 0.05
+FAST_SPAN      = 10
+SLOW_SPAN      = 40
+PEPPER_EXIT_EDGE = 0.5
 
 def updatepos(pos: int, vol: int, maxpos: int = 80):
     new_pos = pos + vol
@@ -39,18 +42,63 @@ class Trader:
             fairprice = VWAP
             
             pos = state.position.get(prod, 0)
+            sell_room = 80 + pos
+            buy_room = 80 - pos
             orders = []
 
             if prod == "INTARIAN_PEPPER_ROOT":
-                if pos < 80 and od.sell_orders:
-                    ba_p = min(od.sell_orders)
-                    buyprice = ba_p
-                    orders.append(Order(prod, buyprice, 80 - pos))
-                    print(f"Order({prod}, {buyprice}, {80 - pos})")
+                wb  = min(od.buy_orders)
+                wa  = max(od.sell_orders)
+                wallmid = (wb + wa) / 2
+
+                ba = min(od.sell_orders)
+                bb = max(od.buy_orders)
+
+                ewm_fast = prev.get("pepper_ewm_fast")
+                ewm_slow = prev.get("pepper_ewm_slow")
+                pepper_entry_live = prev.get("pepper_entry_live", None)
+
+                alpha_f = 2 / (FAST_SPAN + 1)
+                alpha_s = 2 / (SLOW_SPAN + 1)
+
+                if ewm_fast is None:
+                    ewm_fast = wallmid
+                    ewm_slow = wallmid
+                else:
+                    ewm_fast = alpha_f * wallmid + (1 - alpha_f) * ewm_fast
+                    ewm_slow = alpha_s * wallmid + (1 - alpha_s) * ewm_slow
+
+                new_state["pepper_ewm_fast"] = ewm_fast
+                new_state["pepper_ewm_slow"] = ewm_slow
+
+                bullish = (
+                    ewm_fast > ewm_slow
+                )
+                bearish = (
+                    ewm_slow > ewm_fast + PEPPER_EXIT_EDGE
+                )
+
+                if bullish:
+                    pepper_entry_live = True
+
+                new_state["pepper_entry_live"] = pepper_entry_live
+
+                if pepper_entry_live and pos < 80:
+                    orders.append(Order(prod, ba, 80 - pos))
+                    print(f"Order({prod}, {ba}, {80 - pos})")
+                elif bearish:
+                    Spread = ba - bb
+                    if Spread >= 2:
+                        sellprice = ba - 1
+                        buyprice = bb + 1
+                        if sell_room > 0:
+                            orders.append(Order(prod, sellprice, -min(20, sell_room)))
+                            print(f"Order({prod}, {sellprice}, {-min(20, sell_room)})")
+                        if buy_room > 0:
+                            orders.append(Order(prod, buyprice, min(20, buy_room)))
+                            print(f"Order({prod}, {buyprice}, {min(20, buy_room)})")
 
             elif prod == "ASH_COATED_OSMIUM":
-                buy_room  = 80 - pos
-                sell_room = 80 + pos
 
                 prev_ema = prev.get("ema_fair")
                 if prev_ema is not None:
