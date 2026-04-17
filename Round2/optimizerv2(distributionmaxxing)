@@ -33,7 +33,7 @@ def generate_population(N=5538):
 
     # 8. Tiny compensator spikes at X+1 and X-1 next to each round number
     compensators = [r + offset for r in [20,25,30,35,40,45,50,55,60,65,70,75,80]
-                                for offset in [1, -1]]
+                                for offset in [1]]
     for c in compensators:
         components.append(np.random.normal(c, 0.8, int(N * 0.001)))
 
