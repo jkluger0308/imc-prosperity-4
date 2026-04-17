@@ -12,6 +12,10 @@ FLAT_THRESHOLD = 25
 FLAT_TARGET    = 0
 BASE           = 24
 EMA_ALPHA      = 0.05
+FAST_SPAN      = 20
+SLOW_SPAN      = 80
+WARMUP         = 0
+PEPPER_ENTRY_EDGE = 0.5
 
 
 def updatepos(pos: int, vol: int, maxpos: int = 80):
@@ -45,9 +49,44 @@ class Trader:
             orders  = []
 
             if prod == "INTARIAN_PEPPER_ROOT":
-                if pos < 80 and od.sell_orders:
-                    ba_p = min(od.sell_orders)
-                    orders.append(Order(prod, ba_p, 80 - pos))
+                bb  = max(od.buy_orders)
+                ba  = min(od.sell_orders)
+                mid = (bb + ba) / 2
+
+                ewm_fast = prev.get("pepper_ewm_fast")
+                ewm_slow = prev.get("pepper_ewm_slow")
+                tick_count = prev.get("pepper_tick_count", 0)
+                pepper_entry_live = prev.get("pepper_entry_live", False)
+
+                alpha_f = 2 / (FAST_SPAN + 1)
+                alpha_s = 2 / (SLOW_SPAN + 1)
+
+                if ewm_fast is None:
+                    ewm_fast = mid
+                    ewm_slow = mid
+                else:
+                    ewm_fast = alpha_f * mid + (1 - alpha_f) * ewm_fast
+                    ewm_slow = alpha_s * mid + (1 - alpha_s) * ewm_slow
+
+                tick_count += 1
+
+                new_state["pepper_ewm_fast"] = ewm_fast
+                new_state["pepper_ewm_slow"] = ewm_slow
+                new_state["pepper_tick_count"] = tick_count
+
+                bullish = (
+                    tick_count >= WARMUP
+                    and ewm_fast > ewm_slow + PEPPER_ENTRY_EDGE
+                    and mid >= ewm_slow
+                )
+
+                if bullish:
+                    pepper_entry_live = True
+
+                new_state["pepper_entry_live"] = pepper_entry_live
+
+                if pepper_entry_live and pos < 80:
+                    orders.append(Order(prod, ba, 80 - pos))
 
             elif prod == "ASH_COATED_OSMIUM":
                 buy_room  = 80 - pos
