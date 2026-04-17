@@ -1,60 +1,59 @@
 import math
 import itertools
 import re
+import numpy as np
+from scipy.stats import norm
 
-#this is a python program, optimizes the inputs based on different dostributions
+# Generate a population of players (e.g. 10,000) drawn from a normal distribution
+N = 5538
+mean, std = 35, 8  # adjust to taste
+population = np.clip(np.random.normal(mean, std, N), 0, 100)
 
-def parse_expr(raw):
-    s = raw.strip()
-    s = s.replace("^", "**")
-    s = re.sub(r'(\d)([xyz(])', r'\1*\2', s)
-    s = re.sub(r'([xyz])(\d)', r'\1*\2', s)
-    return s
+def speed_multiplier(z, population):
+    """Given your investment z, return the hit rate multiplier based on rank in population."""
+    rank = np.sum(population > z)  # number of players beating you
+    percentile = 1 - (rank / len(population))  # 0 = worst, 1 = best
+    return 0.1 + 0.8 * percentile  # scale to [0.1, 0.9]
 
-def eval_fn(expr, x, y, z):
+BUDGET = 50000
+
+def research(x):
+    return 200000 * np.log(1 + x) / np.log(1 + 100)
+
+def scale(y):
+    return 7 * y / 100
+
+def pnl(x, y, z):
     if x + y + z > 100:
         return -math.inf
-    try:
-        return eval(expr, {"__builtins__": {}}, {
-            "x": x, "y": y, "z": z,
-            "sin": math.sin, "cos": math.cos, "tan": math.tan,
-            "sqrt": math.sqrt, "abs": abs, "ln": math.log,
-            "log": math.log, "exp": math.exp, "pi": math.pi, "e": math.e,
-        })
-    except:
-        return -math.inf
+    budget_used = (x + y + z) / 100 * BUDGET
+    r = research(x)
+    s = scale(y)
+    m = speed_multiplier(z, population)
+    return r * s * m - budget_used
 
-def maximize(raw_expr, bounds=((0,100),(0,100),(0,100)), grid_size=100):
-    expr = parse_expr(raw_expr)
-
-    if eval_fn(expr, 1, 1, 1) == -math.inf:
-        raise ValueError("Could not parse expression.")
-
-    (xmin,xmax), (ymin,ymax), (zmin,zmax) = bounds
+def maximize():
+    best, bx, by, bz = -math.inf, 0, 0, 0
 
     # Coarse grid search (integers only)
-    best, bx, by, bz = -math.inf, 0, 0, 0
-    for i, j, k in itertools.product(range(grid_size + 1), repeat=3):
-        x = round(xmin + (xmax - xmin) * i / grid_size)
-        y = round(ymin + (ymax - ymin) * j / grid_size)
-        z = round(zmin + (zmax - zmin) * k / grid_size)
-        v = eval_fn(expr, x, y, z)
+    for x, y, z in itertools.product(range(101), repeat=3):
+        if x + y + z > 100:
+            continue
+        v = pnl(x, y, z)
         if v > best:
             best, bx, by, bz = v, x, y, z
 
-    # Gradient ascent refinement (integer steps only)
+    # Gradient ascent refinement (integer steps)
     cx, cy, cz = bx, by, bz
     step = 1
     directions = [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
     for _ in range(10000):
         moved = False
         for dx, dy, dz in directions:
-            nx = round(cx + dx * step)
-            ny = round(cy + dy * step)
-            nz = round(cz + dz * step)
-            if not (xmin<=nx<=xmax and ymin<=ny<=ymax and zmin<=nz<=zmax):
+            nx, ny, nz = cx+dx*step, cy+dy*step, cz+dz*step
+            if not (0<=nx<=100 and 0<=ny<=100 and 0<=nz<=100):
                 continue
-            v = eval_fn(expr, nx, ny, nz)
+            v = pnl(nx, ny, nz)
             if v > best:
                 best, cx, cy, cz = v, nx, ny, nz
                 moved = True
@@ -63,9 +62,17 @@ def maximize(raw_expr, bounds=((0,100),(0,100),(0,100)), grid_size=100):
             if step == 1 and not moved:
                 break
 
-    return {"max": best, "x": int(cx), "y": int(cy), "z": int(cz)}
+    return {"pnl": best, "x": int(cx), "y": int(cy), "z": int(cz)}
 
-# --- Usage ---
-result = maximize("ln(1+x) * y * (.1+.008*z)")
-print(f"A = {result['max']:.6f}")
-print(f"at x={result['x']}, y={result['y']}, z={result['z']}")
+# --- Run ---
+result = maximize()
+x, y, z = result["x"], result["y"], result["z"]
+budget_used = (x + y + z) / 100 * BUDGET
+
+print(f"Optimal allocation:")
+print(f"  Research (x) : {x}%  ->  {research(x):,.0f}")
+print(f"  Scale    (y) : {y}%  ->  {scale(y):.2f}")
+print(f"  Speed    (z) : {z}%  ->  {speed_multiplier(z, population):.4f} multiplier")
+print(f"  Budget used  : {budget_used:,.0f} XIRECs ({x+y+z}%)")
+print(f"  Gross PnL    : {research(x) * scale(y) * speed_multiplier(z, population):,.0f}")
+print(f"  Net PnL      : {result['pnl']:,.2f}")
