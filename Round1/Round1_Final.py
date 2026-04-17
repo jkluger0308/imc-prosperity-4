@@ -7,7 +7,7 @@ BASE           = 24
 EMA_ALPHA = 0.05
 FAST_SPAN      = 10
 SLOW_SPAN      = 40
-PEPPER_EXIT_EDGE = 0.5
+PEPPER_EXIT_EDGE = 0.75
 
 def updatepos(pos: int, vol: int, maxpos: int = 80):
     new_pos = pos + vol
@@ -89,8 +89,8 @@ class Trader:
                     orders.append(Order(prod, ba, 80 - pos))
                     print(f"Order({prod}, {ba}, {80 - pos})")
                 elif pepper_entry_live == False:
-                    orders.append(Order(prod, ba - 1, -(80 + pos)))
-                    print(f"Order({prod}, {ba - 1}, {-(80 + pos)})")
+                    orders.append(Order(prod, ba - 1, -min(20, (80 + pos))))
+                    print(f"Order({prod}, {ba - 1}, {-min(20, (80 + pos))})")
 
             elif prod == "ASH_COATED_OSMIUM":
 
