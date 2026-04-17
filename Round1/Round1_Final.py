@@ -80,14 +80,17 @@ class Trader:
 
                 if bullish:
                     pepper_entry_live = True
-                    
+                elif bearish:
+                    pepper_entry_live = False
+                else: 
+                    pepper_entry_live = None
 
                 new_state["pepper_entry_live"] = pepper_entry_live
 
                 if pepper_entry_live:
                     orders.append(Order(prod, ba, 80 - pos))
                     print(f"Order({prod}, {ba}, {80 - pos})")
-                elif bearish:
+                elif pepper_entry_live == False:
                     orders.append(Order(prod, ba - 1, -(80 + pos)))
                     print(f"Order({prod}, {ba - 1}, {-(80 + pos)})")
 
