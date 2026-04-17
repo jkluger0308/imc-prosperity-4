@@ -80,23 +80,16 @@ class Trader:
 
                 if bullish:
                     pepper_entry_live = True
+                    
 
                 new_state["pepper_entry_live"] = pepper_entry_live
 
-                if pepper_entry_live and pos < 80:
+                if pepper_entry_live:
                     orders.append(Order(prod, ba, 80 - pos))
                     print(f"Order({prod}, {ba}, {80 - pos})")
                 elif bearish:
-                    Spread = ba - bb
-                    if Spread >= 2:
-                        sellprice = ba - 1
-                        buyprice = bb + 1
-                        if sell_room > 0:
-                            orders.append(Order(prod, sellprice, -min(20, sell_room)))
-                            print(f"Order({prod}, {sellprice}, {-min(20, sell_room)})")
-                        if buy_room > 0:
-                            orders.append(Order(prod, buyprice, min(20, buy_room)))
-                            print(f"Order({prod}, {buyprice}, {min(20, buy_room)})")
+                    orders.append(Order(prod, ba - 1, -(80 + pos)))
+                    print(f"Order({prod}, {ba - 1}, {-(80 + pos)})")
 
             elif prod == "ASH_COATED_OSMIUM":
 
