@@ -1,15 +1,10 @@
 from datamodel import Order, TradingState
-
-# R1G: R1F with BASE doubled (12 -> 24).
-# Hypothesis: current fills are saturating at ~10 units/side, meaning
-# market orders often arrive bigger than our quoted size. Doubling BASE
-# should capture the overflow and roughly scale PnL with fill volume.
-# Layer 3 flattening (unchanged) handles the faster inventory growth.
+import json
 
 FLAT_THRESHOLD = 50
-FLAT_TARGET    = 40
-BASE           = 24   # was 12 in R1B/R1F
-
+FLAT_TARGET    = 30
+BASE           = 24  
+EMA_ALPHA = 0.05
 
 def updatepos(pos: int, vol: int, maxpos: int = 80):
     new_pos = pos + vol
@@ -24,77 +19,100 @@ class Trader:
     def run(self, state: TradingState):
         result = {}
 
+        prev = {}
+        if state.traderData:
+            try:
+                prev = json.loads(state.traderData)
+            except:
+                prev = {}
+
+        new_state = {}
+
         for prod, od in state.order_depths.items():
             if not od.buy_orders or not od.sell_orders:
                 result[prod] = []
                 continue
 
-            #wb      = min(od.buy_orders)
-            #wa      = max(od.sell_orders)
-            #wallmid = (wb + wa) / 2
-            pos     = state.position.get(prod, 0)
-            orders  = []
+            cm_bid = sum([float(vol*price) for price, vol in od.buy_orders.items()])/sum([float(vol) for price, vol in od.buy_orders.items()])
+            cm_ask = sum([float(abs(vol)*price) for price, vol in od.sell_orders.items()])/sum([float(abs(vol)) for price, vol in od.sell_orders.items()])
+            VWAP = (cm_bid + cm_ask) / 2
+            fairprice = VWAP
+            
+            pos = state.position.get(prod, 0)
+            orders = []
 
             if prod == "INTARIAN_PEPPER_ROOT":
                 if pos < 80 and od.sell_orders:
                     ba_p = min(od.sell_orders)
-                    orders.append(Order(prod, ba_p, 80 - pos))
-                    print(f"Order({prod}, {ba_p}, {80 - pos})")
+                    buyprice = ba_p
+                    orders.append(Order(prod, buyprice, 80 - pos))
+                    print(f"Order({prod}, {buyprice}, {80 - pos})")
 
             elif prod == "ASH_COATED_OSMIUM":
                 buy_room  = 80 - pos
                 sell_room = 80 + pos
 
-                cm_bid = sum([float(vol*price) for price, vol in od.buy_orders.items()])/sum([float(vol) for price, vol in od.buy_orders.items()])
-                cm_ask = sum([float(abs(vol)*price) for price, vol in od.sell_orders.items()])/sum([float(abs(vol)) for price, vol in od.sell_orders.items()])
-                VWAP = (cm_bid + cm_ask) / 2
-                fairprice = VWAP
+                prev_ema = prev.get("ema_fair")
+                if prev_ema is not None:
+                    meanfair = EMA_ALPHA * VWAP + (1 - EMA_ALPHA) * prev_ema
+                else:
+                    meanfair = VWAP
+                new_state["ema_fair"] = meanfair
+
 
                 initial_bids = list(od.buy_orders.items())
                 initial_asks = list(od.sell_orders.items())
 
-                pbid_below_fair = [p for p, v in initial_bids if p < fairprice]
-                pask_above_fair = [p for p, v in initial_asks if p > fairprice]
+                pbid_below_fair = sorted([p for p, v in initial_bids if p < fairprice], reverse=True)
+                pask_above_fair = sorted([p for p, v in initial_asks if p > fairprice])
+                ba = min(pask_above_fair)
+                bb = max(pbid_below_fair)
 
                 # ── Layer 1: take mispriced orders ────────────────────
                 for price, vol in initial_bids:
-                    if price > fairprice and sell_room > 0:
+                    if price > meanfair + 1 and sell_room > 0:
+                        size = min(vol, sell_room)
+                        orders.append(Order(prod, price, -size))
+                        print(f"Order({prod}, {price}, {-size})")
+                        pos, buy_room, sell_room = updatepos(pos, -size)
+                    elif price > meanfair and sell_room > 0 and pos > 0:
                         size = min(vol, sell_room)
                         orders.append(Order(prod, price, -size))
                         print(f"Order({prod}, {price}, {-size})")
                         pos, buy_room, sell_room = updatepos(pos, -size)
 
                 for price, vol in initial_asks:
-                    if price < fairprice and buy_room > 0:
+                    if price < meanfair - 1 and buy_room > 0:
+                        size = min(-vol, buy_room)
+                        orders.append(Order(prod, price, size))
+                        print(f"Order({prod}, {price}, {size})")
+                        pos, buy_room, sell_room = updatepos(pos, size)
+                    elif price < meanfair and buy_room > 0 and pos < 0:
                         size = min(-vol, buy_room)
                         orders.append(Order(prod, price, size))
                         print(f"Order({prod}, {price}, {size})")
                         pos, buy_room, sell_room = updatepos(pos, size)
 
-                # ── Layer 2: passive quotes with inventory size skew ──
-                if pbid_below_fair and pask_above_fair:
-                    bb = max(pbid_below_fair)
-                    ba = min(pask_above_fair)
+                #── Layer 2: passive quotes with inventory size skew ──
+                if meanfair:
+                    I = pos / 80
+                    bid_size = int(BASE * (1 - I))
+                    ask_size = int(BASE * (1 + I))
+                    bid_size = max(0, min(bid_size, buy_room))
+                    ask_size = max(0, min(ask_size, sell_room))
 
-                    if ba - 1 > fairprice and bb + 1 < fairprice:
-                        I = pos / 80
-                        bid_size = int(BASE * (1 - I))
-                        ask_size = int(BASE * (1 + I))
 
-                        bid_size = max(0, min(bid_size, buy_room))
-                        ask_size = max(0, min(ask_size, sell_room))
+                    if ba - 1 > fairprice and ask_size > 0:
+                        orders.append(Order(prod, ba - 1, -ask_size))
+                        pos, buy_room, sell_room = updatepos(pos, -ask_size)
+                        print(f"Order({prod}, {ba-1}, {-ask_size})")
 
-                        if ask_size > 0:
-                            orders.append(Order(prod, ba - 1, -ask_size))
-                            pos, buy_room, sell_room = updatepos(pos, -ask_size)
-                            print(f"Order({prod}, {ba-1}, {-ask_size})")
+                    if bb + 1 < fairprice and bid_size > 0:
+                        orders.append(Order(prod, bb + 1, bid_size))
+                        pos, buy_room, sell_room = updatepos(pos, bid_size)
+                        print(f"Order({prod}, {bb+1}, {bid_size})")
 
-                        if bid_size > 0:
-                            orders.append(Order(prod, bb + 1, bid_size))
-                            pos, buy_room, sell_room = updatepos(pos, bid_size)
-                            print(f"Order({prod}, {bb+1}, {bid_size})")
-
-                # ── Layer 3: zero-edge inventory neutralization ───────
+                #── Layer 3: zero-edge inventory neutralization ───────
                 if pos >= FLAT_THRESHOLD and sell_room > 0:
                     flat_price = int(fairprice)
                     flat_size  = min(pos - FLAT_TARGET, sell_room)
@@ -112,5 +130,5 @@ class Trader:
                         pos, buy_room, sell_room = updatepos(pos, flat_size)
 
             result[prod] = orders
-
-        return result, 0, ""
+        trader_data = json.dumps(new_state)
+        return result, 0, trader_data
