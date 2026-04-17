@@ -72,7 +72,7 @@ class Trader:
                 new_state["pepper_ewm_slow"] = ewm_slow
 
                 bullish = (
-                    ewm_fast > ewm_slow
+                    ewm_fast >= ewm_slow
                 )
                 bearish = (
                     ewm_slow > ewm_fast + PEPPER_EXIT_EDGE
@@ -82,8 +82,6 @@ class Trader:
                     pepper_entry_live = True
                 elif bearish:
                     pepper_entry_live = False
-                else: 
-                    pepper_entry_live = None
 
                 new_state["pepper_entry_live"] = pepper_entry_live
 
@@ -109,8 +107,8 @@ class Trader:
 
                 pbid_below_fair = sorted([p for p, v in initial_bids if p < fairprice], reverse=True)
                 pask_above_fair = sorted([p for p, v in initial_asks if p > fairprice])
-                ba = min(pask_above_fair)
-                bb = max(pbid_below_fair)
+                ba = min(pask_above_fair) if pask_above_fair else None
+                bb = max(pbid_below_fair) if pask_above_fair else None
 
                 # ── Layer 1: take mispriced orders ────────────────────
                 for price, vol in initial_bids:
@@ -146,12 +144,12 @@ class Trader:
                     ask_size = max(0, min(ask_size, sell_room))
 
 
-                    if ba - 1 > fairprice and ask_size > 0:
+                    if ba and ba - 1 > fairprice and ask_size > 0:
                         orders.append(Order(prod, ba - 1, -ask_size))
                         pos, buy_room, sell_room = updatepos(pos, -ask_size)
                         print(f"Order({prod}, {ba-1}, {-ask_size})")
 
-                    if bb + 1 < fairprice and bid_size > 0:
+                    if bb and bb + 1 < fairprice and bid_size > 0:
                         orders.append(Order(prod, bb + 1, bid_size))
                         pos, buy_room, sell_room = updatepos(pos, bid_size)
                         print(f"Order({prod}, {bb+1}, {bid_size})")
