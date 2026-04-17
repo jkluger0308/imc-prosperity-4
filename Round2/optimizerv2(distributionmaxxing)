@@ -1,0 +1,78 @@
+import math
+import itertools
+import re
+import numpy as np
+from scipy.stats import norm
+
+# Generate a population of players (e.g. 10,000) drawn from a normal distribution
+N = 5538
+mean, std = 35, 8  # adjust to taste
+population = np.clip(np.random.normal(mean, std, N), 0, 100)
+
+def speed_multiplier(z, population):
+    """Given your investment z, return the hit rate multiplier based on rank in population."""
+    rank = np.sum(population > z)  # number of players beating you
+    percentile = 1 - (rank / len(population))  # 0 = worst, 1 = best
+    return 0.1 + 0.8 * percentile  # scale to [0.1, 0.9]
+
+BUDGET = 50000
+
+def research(x):
+    return 200000 * np.log(1 + x) / np.log(1 + 100)
+
+def scale(y):
+    return 7 * y / 100
+
+def pnl(x, y, z):
+    if x + y + z > 100:
+        return -math.inf
+    budget_used = (x + y + z) / 100 * BUDGET
+    r = research(x)
+    s = scale(y)
+    m = speed_multiplier(z, population)
+    return r * s * m - budget_used
+
+def maximize():
+    best, bx, by, bz = -math.inf, 0, 0, 0
+
+    # Coarse grid search (integers only)
+    for x, y, z in itertools.product(range(101), repeat=3):
+        if x + y + z > 100:
+            continue
+        v = pnl(x, y, z)
+        if v > best:
+            best, bx, by, bz = v, x, y, z
+
+    # Gradient ascent refinement (integer steps)
+    cx, cy, cz = bx, by, bz
+    step = 1
+    directions = [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
+    for _ in range(10000):
+        moved = False
+        for dx, dy, dz in directions:
+            nx, ny, nz = cx+dx*step, cy+dy*step, cz+dz*step
+            if not (0<=nx<=100 and 0<=ny<=100 and 0<=nz<=100):
+                continue
+            v = pnl(nx, ny, nz)
+            if v > best:
+                best, cx, cy, cz = v, nx, ny, nz
+                moved = True
+        if not moved:
+            step = max(step - 1, 1)
+            if step == 1 and not moved:
+                break
+
+    return {"pnl": best, "x": int(cx), "y": int(cy), "z": int(cz)}
+
+# --- Run ---
+result = maximize()
+x, y, z = result["x"], result["y"], result["z"]
+budget_used = (x + y + z) / 100 * BUDGET
+
+print(f"Optimal allocation:")
+print(f"  Research (x) : {x}%  ->  {research(x):,.0f}")
+print(f"  Scale    (y) : {y}%  ->  {scale(y):.2f}")
+print(f"  Speed    (z) : {z}%  ->  {speed_multiplier(z, population):.4f} multiplier")
+print(f"  Budget used  : {budget_used:,.0f} XIRECs ({x+y+z}%)")
+print(f"  Gross PnL    : {research(x) * scale(y) * speed_multiplier(z, population):,.0f}")
+print(f"  Net PnL      : {result['pnl']:,.2f}")
