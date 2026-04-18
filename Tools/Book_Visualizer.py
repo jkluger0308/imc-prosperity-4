@@ -47,7 +47,7 @@ DEFAULT_ROOTS = [SCRIPT_DIR / "backtests", Path.home() / "Downloads"]
 CACHE_DIR = SCRIPT_DIR / ".cache_dashboard"
 GUIDE_PATH = SCRIPT_DIR / "ORDERBOOK_DASHBOARD_GUIDE.md"
 # Bump when parsed book/trade metrics change so stale pickles are not reused.
-PARSED_CACHE_VERSION = "18"
+PARSED_CACHE_VERSION = "19"
 ORDER_PRINT_RE = re.compile(
     r"Order\(\s*([^,]+?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)"
 )
@@ -589,8 +589,6 @@ def add_book_metrics(df: pd.DataFrame) -> pd.DataFrame:
     # If a side has no valid volume in the three levels, VWAP is NaN — fall back to touch mid for plotting.
     out["vwap"] = out["vwap"].fillna(out["mid_touch"])
     out["mean_fair"] = mean_fair_ema_from_vwap(out["vwap"], MEAN_FAIR_ALPHA)
-    # RSI (Wilder) on touch mid — classic "price" proxy for each LOB snapshot.
-    out["rsi"] = rsi_wilder(out["mid_touch"], RSI_PERIOD)
     return out
 
 
@@ -889,6 +887,7 @@ def build_main_figure(
     overlay_metrics: Optional[list[str]] = None,
     size_buckets: Optional[list[str]] = None,
     zscore_span: int = 20,
+    rsi_period: int = RSI_PERIOD,
     order_audit_df: Optional[pd.DataFrame] = None,
 ) -> go.Figure:
     b_full = book[book["product"].astype(str) == product].copy()
@@ -903,6 +902,13 @@ def build_main_figure(
 
     b_full = b_full.sort_values("timestamp")
     b_full = add_book_metrics(b_full)
+    om = overlay_metrics or []
+    try:
+        rsi_p_eff = max(2, int(float(rsi_period)))
+    except (TypeError, ValueError):
+        rsi_p_eff = RSI_PERIOD
+    if "rsi" in om and "mid_touch" in b_full.columns:
+        b_full["rsi"] = rsi_wilder(b_full["mid_touch"], rsi_p_eff)
     b = thin_series(b_full.copy(), "timestamp", max_points)
 
     base_col = norm_base if norm_base in b.columns else "wallmid"
@@ -982,7 +988,6 @@ def build_main_figure(
             )
         )
 
-    om = overlay_metrics or []
     has_spread = "spread" in om and "spread" in b.columns
     has_imb = "imbalance" in om and "imbalance_ratio" in b.columns
     has_z = "zscore" in om
@@ -1039,7 +1044,7 @@ def build_main_figure(
                 x=b["timestamp"],
                 y=b["rsi"],
                 mode="lines",
-                name=f"RSI (Wilder, period={RSI_PERIOD}, touch mid)",
+                name=f"RSI (Wilder, period={rsi_p_eff}, touch mid)",
                 line=dict(color="coral", width=1.35),
                 yaxis="y4",
             )
@@ -1334,7 +1339,7 @@ def build_main_figure(
         else:
             y4_pos = 1.0
         layout["yaxis4"] = dict(
-            title=f"RSI (0–100, Wilder {RSI_PERIOD}, touch mid)",
+            title=f"RSI (0–100, Wilder {rsi_p_eff}, touch mid)",
             overlaying="y",
             side="right",
             anchor="free",
@@ -1904,6 +1909,8 @@ def create_app(roots: list[Path]) -> Dash:
                     ),
                     html.Label("Z-score span"),
                     dcc.Input(id="zscore-span", type="number", min=2, step=1, value=20, style={"width": "90px"}),
+                    html.Label("RSI period"),
+                    dcc.Input(id="rsi-period", type="number", min=2, step=1, value=14, style={"width": "90px"}),
                     html.Label("Size buckets"),
                     dcc.Checklist(
                         id="size-bucket-cl",
@@ -2013,6 +2020,7 @@ def create_app(roots: list[Path]) -> Dash:
         Input("max-points", "value"),
         Input("overlay-cl", "value"),
         Input("zscore-span", "value"),
+        Input("rsi-period", "value"),
         Input("size-bucket-cl", "value"),
         Input("main-graph", "hoverData"),
         State("viewport-store", "data"),
@@ -2029,6 +2037,7 @@ def create_app(roots: list[Path]) -> Dash:
         max_pts,
         overlay_vals,
         zscore_span,
+        rsi_period_val,
         size_buckets,
         hover,
         viewport,
@@ -2061,6 +2070,10 @@ def create_app(roots: list[Path]) -> Dash:
 
         overlays = [str(x) for x in (overlay_vals or [])]
         zsp = int(zscore_span) if zscore_span else 20
+        try:
+            rsp = max(2, int(float(rsi_period_val)))
+        except (TypeError, ValueError):
+            rsp = RSI_PERIOD
         buckets = [str(x) for x in (size_buckets or ["S", "B"])]
         audit_df = build_order_fill_audit_df(logs, trades, product)
         main = build_main_figure(
@@ -2078,6 +2091,7 @@ def create_app(roots: list[Path]) -> Dash:
             overlay_metrics=overlays,
             size_buckets=buckets if buckets else None,
             zscore_span=max(2, zsp),
+            rsi_period=rsp,
             order_audit_df=audit_df,
         )
         main.update_layout(uirevision=f"{store.get('path')}:{product}")
