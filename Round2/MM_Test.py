@@ -1,15 +1,18 @@
 from datamodel import Order, TradingState
 import json
 
-FLAT_THRESHOLD_HARD = 15
 FLAT_TARGET_HARD = 10
 FLAT_THRESHOLD_SOFT = FLAT_TARGET_HARD
 FLAT_TARGET_SOFT    = 0
 BASE           = 24  
 EMA_ALPHA = 0.05
 FAST_SPAN      = 10
-SLOW_SPAN      = 40
-PEPPER_EXIT_EDGE = 0.75
+SLOW_SPAN      = FAST_SPAN * 4
+OSM_SPANF = 5
+OSM_SPANS = 4*OSM_SPANF
+PEPPER_EDGE = 0.2
+OSMIUM_EDGE = 0.5
+
 
 def updatepos(pos: int, vol: int, maxpos: int = 80):
     new_pos = pos + vol
@@ -77,7 +80,7 @@ class Trader:
                     ewm_fast >= ewm_slow
                 )
                 bearish = (
-                    ewm_slow > ewm_fast + PEPPER_EXIT_EDGE
+                    ewm_slow > ewm_fast + PEPPER_EDGE
                 )
 
                 if bullish:
@@ -102,6 +105,25 @@ class Trader:
                 else:
                     meanfair = VWAP
                 new_state["ema_fair"] = meanfair
+
+                prev_ema_f = prev.get("ema_osmium_fast")
+                alpha_f = 2/(OSM_SPANF + 1)
+                if prev_ema_f is not None:
+                    ema_f = alpha_f*VWAP + (1 - alpha_f)*prev_ema_f
+                else:
+                    ema_f = VWAP
+                new_state["ema_osmium_fast"] = ema_f
+
+                prev_ema_s = prev.get("ema_osmium_slow")
+                alpha_s = 2/(OSM_SPANS + 1)
+                if prev_ema_s is not None:
+                    ema_s = alpha_s*VWAP + (1 - alpha_s)*prev_ema_s
+                else:
+                    ema_s = VWAP
+                new_state["ema_osmium_slow"] = ema_s
+
+                trending_up = ema_f > ema_s + OSMIUM_EDGE
+                trending_down = ema_f + OSMIUM_EDGE < ema_s
 
 
                 initial_bids = list(od.buy_orders.items())
@@ -147,18 +169,28 @@ class Trader:
 
 
                     if ba and ba - 1 > fairprice and ask_size > 0:
-                        orders.append(Order(prod, ba - 1, -ask_size))
-                        print(f"Order({prod}, {ba-1}, {-ask_size})")
+                        sellprice = ba - 1
+                        # if trending_down and ba - 2 > fairprice:
+                        #     sellprice = ba - 2
+                        if trending_up and ba > fairprice:
+                            buyprice = ba
+                        orders.append(Order(prod, sellprice, -ask_size))
+                        print(f"Order({prod}, {sellprice}, {-ask_size})")
 
                     if bb and bb + 1 < fairprice and bid_size > 0:
-                        orders.append(Order(prod, bb + 1, bid_size))
-                        print(f"Order({prod}, {bb+1}, {bid_size})")
+                        buyprice = bb + 1
+                        # if trending_up and bb + 2 < fairprice:
+                        #     buyprice = bb + 2
+                        if trending_down and bb < fairprice:
+                            buyprice = bb
+                        orders.append(Order(prod, buyprice, bid_size))
+                        print(f"Order({prod}, {buyprice}, {bid_size})")
 
                 #── Layer 3: zero-edge inventory neutralization ──────-
 
-                if pos >= FLAT_THRESHOLD_HARD and sell_room > 0:
+                if pos >= FLAT_TARGET_HARD and sell_room > 0:
                     # ``ba`` can be None when no ask is above ``meanfair``; fall back to best ask + 1.
-                    flat_price = (ba - 1) if ba is not None else round(fairprice)
+                    flat_price = (bb) if bb is not None else round(fairprice)
                     flat_size  = min(pos - FLAT_TARGET_HARD, sell_room)
                     orders.append(Order(prod, flat_price, -flat_size))
                     print(f"Order({prod}, {flat_price}, {-flat_size})")
@@ -170,8 +202,8 @@ class Trader:
                         orders.append(Order(prod, flat_price, -flat_size))
                         print(f"Order({prod}, {flat_price}, {-flat_size})")
                 
-                elif pos <= -FLAT_THRESHOLD_HARD and buy_room > 0:
-                    flat_price = (bb + 1) if bb is not None else round(fairprice)
+                elif pos <= -FLAT_TARGET_HARD and buy_room > 0:
+                    flat_price = (ba) if ba is not None else round(fairprice)
                     flat_size  = min(-pos - FLAT_TARGET_HARD, buy_room)
                     if flat_size > 0:
                         orders.append(Order(prod, flat_price, flat_size))
