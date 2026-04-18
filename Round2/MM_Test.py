@@ -35,7 +35,6 @@ class Trader:
 
         for prod, od in state.order_depths.items():
             if not od.buy_orders or not od.sell_orders:
-                new_state = prev
                 result[prod] = []
                 continue
 
@@ -108,8 +107,8 @@ class Trader:
                 initial_bids = list(od.buy_orders.items())
                 initial_asks = list(od.sell_orders.items())
 
-                pbid_below_fair = sorted([p for p, v in initial_bids if p < fairprice], reverse=True)
-                pask_above_fair = sorted([p for p, v in initial_asks if p > fairprice])
+                pbid_below_fair = sorted([p for p, v in initial_bids if p < meanfair], reverse=True)
+                pask_above_fair = sorted([p for p, v in initial_asks if p > meanfair])
                 ba = min(pask_above_fair) if pask_above_fair else None
                 bb = max(pbid_below_fair) if pbid_below_fair else None
 
@@ -158,7 +157,9 @@ class Trader:
                 #── Layer 3: zero-edge inventory neutralization ──────-
 
                 if pos >= FLAT_THRESHOLD_HARD and sell_room > 0:
-                    flat_price = ba
+                    # ``ba`` can be None when no ask is above ``meanfair``; fall back to best ask + 1.
+                    touch_ask = min(od.sell_orders)
+                    flat_price = (ba + 1) if ba is not None else (touch_ask + 1)
                     flat_size  = min(pos - FLAT_TARGET_HARD, sell_room)
                     orders.append(Order(prod, flat_price, -flat_size))
                     print(f"Order({prod}, {flat_price}, {-flat_size})")
@@ -171,8 +172,9 @@ class Trader:
                         print(f"Order({prod}, {flat_price}, {-flat_size})")
                 
                 elif pos <= -FLAT_THRESHOLD_HARD and buy_room > 0:
-                    flat_price = bb
-                    flat_size  = min(-pos - FLAT_TARGET_SOFT, buy_room)
+                    touch_bid = max(od.buy_orders)
+                    flat_price = (bb - 1) if bb is not None else (touch_bid - 1)
+                    flat_size  = min(-pos - FLAT_TARGET_HARD, buy_room)
                     if flat_size > 0:
                         orders.append(Order(prod, flat_price, flat_size))
                         print(f"Order({prod}, {flat_price}, {flat_size})")
