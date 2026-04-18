@@ -15,11 +15,18 @@ import json
 import pickle
 import re
 import socket
+import sys
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
+
+# Shared mean-fair EWMA (pandas only) — lives next to ``datamodel.py``, not in ``tools/``.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from ema_fair import MEAN_FAIR_ALPHA, mean_fair_ema_from_vwap  # noqa: E402
 
 # -----------------------------------------------------------------------------
 # Optional Dash (fail fast with install hint)
@@ -40,10 +47,12 @@ DEFAULT_ROOTS = [SCRIPT_DIR / "backtests", Path.home() / "Downloads"]
 CACHE_DIR = SCRIPT_DIR / ".cache_dashboard"
 GUIDE_PATH = SCRIPT_DIR / "ORDERBOOK_DASHBOARD_GUIDE.md"
 # Bump when parsed book/trade metrics change so stale pickles are not reused.
-PARSED_CACHE_VERSION = "11"
+PARSED_CACHE_VERSION = "18"
 ORDER_PRINT_RE = re.compile(
     r"Order\(\s*([^,]+?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)"
 )
+# ``imc-v15.py`` prints ``OSMPOS: {pos}`` after OSMIUM logic (sandbox log).
+_OSMPOS_PRINT_RE = re.compile(r"OSMPOS:\s*(-?\d+)")
 
 
 def _load_guide_markdown() -> str:
@@ -489,12 +498,70 @@ def parse_log_file(path: Path) -> dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Metrics: wallmid, overlays, normalization
+# Metrics: wallmid, VWAP (L1–L3, imc-v13 formula), overlays, normalization
 # -----------------------------------------------------------------------------
 BID_P = ["bid_price_1", "bid_price_2", "bid_price_3"]
 ASK_P = ["ask_price_1", "ask_price_2", "ask_price_3"]
 BID_V = ["bid_volume_1", "bid_volume_2", "bid_volume_3"]
 ASK_V = ["ask_volume_1", "ask_volume_2", "ask_volume_3"]
+
+def vwap_l3_like_imc_v13(df: pd.DataFrame) -> pd.Series:
+    """
+    Same VWAP definition as ``imc-v13.py`` on the order book dict, evaluated on the
+    L1–L3 columns available in activities/CSV rows (full depth is not in the file).
+
+    cm_bid = sum(vol * price) / sum(vol) over bid levels (raw ``vol``, like ``buy_orders``).
+    cm_ask = sum(abs(vol) * price) / sum(abs(vol)) over ask levels (like ``sell_orders``).
+    VWAP = (cm_bid + cm_ask) / 2
+
+    Only (price, vol) pairs with **both** finite are included — missing cells are omitted
+    like absent dict entries, not forced to volume 0 before weighting.
+    """
+    if df.empty:
+        return pd.Series(dtype=float)
+    bid_px = df.reindex(columns=BID_P).to_numpy(dtype=float)
+    bid_v = df.reindex(columns=BID_V).to_numpy(dtype=float)
+    ask_px = df.reindex(columns=ASK_P).to_numpy(dtype=float)
+    ask_v = df.reindex(columns=ASK_V).to_numpy(dtype=float)
+    mb = np.isfinite(bid_px) & np.isfinite(bid_v)
+    ma = np.isfinite(ask_px) & np.isfinite(ask_v)
+    b_num = np.sum(np.where(mb, bid_px * bid_v, 0.0), axis=1)
+    b_den = np.sum(np.where(mb, bid_v, 0.0), axis=1)
+    avabs = np.abs(ask_v)
+    a_num = np.sum(np.where(ma, ask_px * avabs, 0.0), axis=1)
+    a_den = np.sum(np.where(ma, avabs, 0.0), axis=1)
+    cm_b = np.divide(b_num, b_den, out=np.full(b_num.shape, np.nan, dtype=float), where=b_den != 0)
+    cm_a = np.divide(a_num, a_den, out=np.full(a_num.shape, np.nan, dtype=float), where=a_den != 0)
+    v = (cm_b + cm_a) / 2.0
+    return pd.Series(v, index=df.index)
+
+
+# Wilder RSI period (standard 14); applied to touch mid per timestamp.
+RSI_PERIOD = 14
+
+
+def rsi_wilder(close: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
+    """
+    Relative Strength Index (Wilder / RMA smoothing).
+
+    Gains and losses use ``ewm(alpha=1/period, adjust=False).mean()``, matching
+    Wilder's smoothing factor. ``RS = avg_gain / avg_loss`` (loss 0 treated as NaN
+    so RS → ∞ → RSI 100 when there is up-move). ``RSI = 100 - 100/(1+RS)``, values
+    clipped to ``[0, 100]``. First ``period`` rows may be NaN until the EWM warms.
+    """
+    s = pd.to_numeric(close, errors="coerce")
+    p = max(2, int(period))
+    delta = s.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    alpha = 1.0 / float(p)
+    avg_gain = gain.ewm(alpha=alpha, min_periods=p, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=alpha, min_periods=p, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    flat = (avg_gain.fillna(0.0) <= 0.0) & (avg_loss.fillna(0.0) <= 0.0)
+    rsi = rsi.where(~flat, 50.0)
+    return rsi.clip(lower=0.0, upper=100.0)
 
 
 def add_book_metrics(df: pd.DataFrame) -> pd.DataFrame:
@@ -517,6 +584,13 @@ def add_book_metrics(df: pd.DataFrame) -> pd.DataFrame:
     den = bv + av
     out["imbalance_ratio"] = ((bv - av) / den).where(den.abs() > 1e-9, 0.0)
     out["spread"] = out["best_ask"] - out["best_bid"]
+    # VWAP: same formula as ``imc-v13.py`` on L1–L3 snapshot (see ``vwap_l3_like_imc_v13``).
+    out["vwap"] = vwap_l3_like_imc_v13(out)
+    # If a side has no valid volume in the three levels, VWAP is NaN — fall back to touch mid for plotting.
+    out["vwap"] = out["vwap"].fillna(out["mid_touch"])
+    out["mean_fair"] = mean_fair_ema_from_vwap(out["vwap"], MEAN_FAIR_ALPHA)
+    # RSI (Wilder) on touch mid — classic "price" proxy for each LOB snapshot.
+    out["rsi"] = rsi_wilder(out["mid_touch"], RSI_PERIOD)
     return out
 
 
@@ -533,6 +607,30 @@ def normalize_price_series(y: pd.Series, base: pd.Series, mode: str) -> pd.Serie
             return d / s
         return d * 0.0
     return y
+
+
+# When baseline == this overlay column, y - baseline is all zeros (invisible). Use another ref.
+_OVERLAY_ALT_REF_ORDER = ("wallmid", "mid_touch", "mid_price", "vwap", "mean_fair")
+
+
+def normalize_overlay_line(
+    y: pd.Series,
+    b: pd.DataFrame,
+    base_s: pd.Series,
+    norm_mode: str,
+    baseline_col: str,
+    line_col: str,
+) -> pd.Series:
+    """Normalize wallmid / touch / vwap / mean_fair for the main chart without self-cancellation."""
+    if norm_mode == "none" or baseline_col != line_col:
+        return normalize_price_series(y, base_s, norm_mode)
+    for alt_c in _OVERLAY_ALT_REF_ORDER:
+        if alt_c == line_col or alt_c not in b.columns:
+            continue
+        alt = pd.to_numeric(b[alt_c], errors="coerce").reindex(y.index)
+        if alt.notna().any():
+            return normalize_price_series(y, alt, norm_mode)
+    return normalize_price_series(y, base_s, norm_mode)
 
 
 def ewm_zscore(series: pd.Series, span: int) -> pd.Series:
@@ -732,6 +830,37 @@ def position_from_own_trades(trades_df: pd.DataFrame, product: str) -> pd.DataFr
     return pd.DataFrame(rows, columns=["timestamp", "position"])
 
 
+def simulated_osmium_positions_from_logs(logs_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Parse ``OSMPOS: <int>`` lines from sandbox/lambda log messages (``imc-v15``).
+    Returns empty DataFrame if no matches — dashboard stays usable without this data.
+    """
+    if logs_df is None or logs_df.empty:
+        return pd.DataFrame(columns=["timestamp", "sim_position"])
+    for col in ("timestamp", "message"):
+        if col not in logs_df.columns:
+            return pd.DataFrame(columns=["timestamp", "sim_position"])
+    rows: list[tuple[int, int]] = []
+    lg = logs_df.sort_values("timestamp", kind="mergesort")
+    for _, r in lg.iterrows():
+        msg = str(r.get("message", "") or "")
+        ts_raw = r.get("timestamp")
+        if pd.isna(ts_raw):
+            continue
+        try:
+            ts_i = int(float(ts_raw))
+        except (TypeError, ValueError):
+            continue
+        for m in _OSMPOS_PRINT_RE.finditer(msg):
+            try:
+                rows.append((ts_i, int(m.group(1))))
+            except ValueError:
+                continue
+    if not rows:
+        return pd.DataFrame(columns=["timestamp", "sim_position"])
+    return pd.DataFrame(rows, columns=["timestamp", "sim_position"])
+
+
 # -----------------------------------------------------------------------------
 # Downsampling
 # -----------------------------------------------------------------------------
@@ -807,9 +936,9 @@ def build_main_figure(
                     )
                 )
 
-    # overlays
+    # overlays (reference lines): avoid normalizing a series vs itself → flat zeros / invisible trace
     if "wallmid" in b.columns:
-        yw = normalize_price_series(b["wallmid"], base_s, norm_mode)
+        yw = normalize_overlay_line(b["wallmid"], b, base_s, norm_mode, base_col, "wallmid")
         fig.add_trace(
             go.Scattergl(
                 x=b["timestamp"],
@@ -820,7 +949,7 @@ def build_main_figure(
             )
         )
     if "mid_touch" in b.columns:
-        ym = normalize_price_series(b["mid_touch"], base_s, norm_mode)
+        ym = normalize_overlay_line(b["mid_touch"], b, base_s, norm_mode, base_col, "mid_touch")
         fig.add_trace(
             go.Scattergl(
                 x=b["timestamp"],
@@ -830,13 +959,37 @@ def build_main_figure(
                 line=dict(color="cyan", width=1),
             )
         )
+    if "vwap" in b.columns:
+        yv = normalize_overlay_line(b["vwap"], b, base_s, norm_mode, base_col, "vwap")
+        fig.add_trace(
+            go.Scattergl(
+                x=b["timestamp"],
+                y=yv,
+                mode="lines",
+                name="VWAP (imc-v13 formula, L1–L3 snapshot)",
+                line=dict(color="gold", width=1.1),
+            )
+        )
+    if "mean_fair" in b.columns:
+        ymf = normalize_overlay_line(b["mean_fair"], b, base_s, norm_mode, base_col, "mean_fair")
+        fig.add_trace(
+            go.Scattergl(
+                x=b["timestamp"],
+                y=ymf,
+                mode="lines",
+                name=f"mean_fair EMA (α={MEAN_FAIR_ALPHA}, imc-v13 ema_fair / L1–L3 VWAP)",
+                line=dict(color="orchid", width=1.15, dash="dash"),
+            )
+        )
 
     om = overlay_metrics or []
     has_spread = "spread" in om and "spread" in b.columns
     has_imb = "imbalance" in om and "imbalance_ratio" in b.columns
     has_z = "zscore" in om
+    has_rsi = "rsi" in om and "rsi" in b.columns
     use_y2 = has_spread
     use_y3 = False
+    use_y4 = has_rsi
     if has_spread:
         fig.add_trace(
             go.Scattergl(
@@ -861,7 +1014,11 @@ def build_main_figure(
         )
         use_y3 = True
     if has_z:
-        z_base_col = "mid_touch" if "mid_touch" in b.columns else ("wallmid" if "wallmid" in b.columns else "mid_price")
+        z_base_col = (
+            "mid_touch"
+            if "mid_touch" in b.columns
+            else ("vwap" if "vwap" in b.columns else ("wallmid" if "wallmid" in b.columns else "mid_price"))
+        )
         if z_base_col in b.columns:
             z_s = ewm_zscore(b[z_base_col], zscore_span)
             fig.add_trace(
@@ -875,6 +1032,18 @@ def build_main_figure(
                 )
             )
             use_y3 = True
+
+    if has_rsi:
+        fig.add_trace(
+            go.Scattergl(
+                x=b["timestamp"],
+                y=b["rsi"],
+                mode="lines",
+                name=f"RSI (Wilder, period={RSI_PERIOD}, touch mid)",
+                line=dict(color="coral", width=1.35),
+                yaxis="y4",
+            )
+        )
 
     # Placed-order audit overlays (derived from sandbox/lambda Order(...) prints + SUBMISSION fills)
     # Show only problematic placed intents by default: unfilled / partial.
@@ -1155,6 +1324,25 @@ def build_main_figure(
             zerolinecolor="deepskyblue",
             range=[-z_max, z_max],
         )
+    if use_y4:
+        if use_y2 and use_y3:
+            y4_pos = 1.02
+        elif use_y3:
+            y4_pos = 1.06
+        elif use_y2:
+            y4_pos = 1.03
+        else:
+            y4_pos = 1.0
+        layout["yaxis4"] = dict(
+            title=f"RSI (0–100, Wilder {RSI_PERIOD}, touch mid)",
+            overlaying="y",
+            side="right",
+            anchor="free",
+            position=y4_pos,
+            showgrid=False,
+            range=[0, 100],
+            fixedrange=False,
+        )
     fig.update_layout(**layout)
     if x_range:
         lo, hi = x_range
@@ -1220,9 +1408,18 @@ def build_position_figure(
     product: str,
     book: pd.DataFrame,
     positions_df: Optional[pd.DataFrame] = None,
+    logs_df: Optional[pd.DataFrame] = None,
 ) -> go.Figure:
-    pos_df = position_from_own_trades(trades, product)
     fig = go.Figure()
+    prod_s = str(product)
+
+    sim_df = pd.DataFrame()
+    if prod_s == "ASH_COATED_OSMIUM" and logs_df is not None and not logs_df.empty:
+        sim_df = simulated_osmium_positions_from_logs(logs_df)
+
+    pos_df = position_from_own_trades(trades, product)
+    title_main = ""
+
     if not pos_df.empty:
         fig.add_trace(
             go.Scatter(
@@ -1233,22 +1430,15 @@ def build_position_figure(
                 line=dict(color="violet"),
             )
         )
-        fig.update_layout(
-            template="plotly_dark",
-            height=220,
-            margin=dict(l=40, r=20, t=40, b=40),
-            title="Position (from SUBMISSION trades)",
-        )
-        return fig
-
-    if positions_df is not None and not positions_df.empty and "product" in positions_df.columns:
-        sub = positions_df[positions_df["product"].astype(str) == str(product)]
+        title_main = "from SUBMISSION trades"
+    elif positions_df is not None and not positions_df.empty and "product" in positions_df.columns:
+        sub = positions_df[positions_df["product"].astype(str) == prod_s]
         if not sub.empty:
             qraw = sub.iloc[0].get("quantity")
             if pd.notna(qraw):
                 q = float(qraw)
                 b = (
-                    book[book["product"].astype(str) == str(product)]
+                    book[book["product"].astype(str) == prod_s]
                     if not book.empty and "product" in book.columns
                     else pd.DataFrame()
                 )
@@ -1265,31 +1455,56 @@ def build_position_figure(
                                 line=dict(color="violet", width=2),
                             )
                         )
-                        fig.update_layout(
-                            template="plotly_dark",
-                            height=220,
-                            margin=dict(l=40, r=20, t=40, b=40),
-                            title=f"Position (final `positions` export): {q:g}",
+                        title_main = f"final `positions` export: {q:g}"
+                if not fig.data:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[0],
+                            y=[q],
+                            mode="markers",
+                            marker=dict(size=14, color="violet"),
+                            name="Final",
                         )
-                        return fig
-                fig.add_trace(
-                    go.Scatter(
-                        x=[0],
-                        y=[q],
-                        mode="markers",
-                        marker=dict(size=14, color="violet"),
-                        name="Final",
                     )
-                )
-                fig.update_layout(
-                    template="plotly_dark",
-                    height=220,
-                    margin=dict(l=40, r=20, t=40, b=40),
-                    title=f"Position (final `positions` export, no book for product): {q:g}",
-                )
-                return fig
+                    title_main = f"final `positions` export, no book for product: {q:g}"
 
-    fig.update_layout(title="Position (no trades or `positions` entry)", template="plotly_dark", height=220)
+    if not sim_df.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=sim_df["timestamp"],
+                y=sim_df["sim_position"],
+                mode="lines+markers",
+                name="Simulated pos (OSMPOS)",
+                line=dict(color="cyan", width=2, dash="dash"),
+                marker=dict(size=7, symbol="diamond", line=dict(width=0.5, color="black")),
+            )
+        )
+
+    if not fig.data:
+        fig.update_layout(
+            title="Position (no trades, `positions` entry, or OSMPOS logs)",
+            template="plotly_dark",
+            height=220,
+            margin=dict(l=40, r=20, t=40, b=40),
+        )
+        return fig
+
+    if title_main and not sim_df.empty:
+        title = f"Position ({title_main}) + simulated OSMIUM (OSMPOS)"
+    elif title_main:
+        title = f"Position ({title_main})"
+    elif not sim_df.empty:
+        title = "Position — simulated OSMIUM only (OSMPOS log)"
+    else:
+        title = "Position"
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=220,
+        margin=dict(l=40, r=20, t=40, b=40),
+        title=title,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
     return fig
 
 
@@ -1630,6 +1845,8 @@ def create_app(roots: list[Path]) -> Dash:
                         options=[
                             {"label": "wallmid", "value": "wallmid"},
                             {"label": "mid_touch", "value": "mid_touch"},
+                            {"label": "VWAP (L1–L3)", "value": "vwap"},
+                            {"label": "mean_fair EMA (imc-v13)", "value": "mean_fair"},
                             {"label": "mid_price (CSV)", "value": "mid_price"},
                         ],
                         value="wallmid",
@@ -1680,6 +1897,7 @@ def create_app(roots: list[Path]) -> Dash:
                             {"label": "Spread", "value": "spread"},
                             {"label": "Vol imbalance (norm)", "value": "imbalance"},
                             {"label": "Z-score", "value": "zscore"},
+                            {"label": "RSI (Wilder, touch mid)", "value": "rsi"},
                         ],
                         value=[],
                         inline=True,
@@ -1869,6 +2087,7 @@ def create_app(roots: list[Path]) -> Dash:
             product,
             book,
             positions_df if isinstance(positions_df, pd.DataFrame) else pd.DataFrame(),
+            logs if isinstance(logs, pd.DataFrame) else pd.DataFrame(),
         )
 
         ts = None
