@@ -10,7 +10,7 @@ FAST_SPAN      = 10
 SLOW_SPAN      = FAST_SPAN * 4
 OSM_SPANF = 5
 OSM_SPANS = 4*OSM_SPANF
-PEPPER_EDGE = 0.2
+PEPPER_EDGE = 2
 OSMIUM_EDGE = 0.5
 
 
@@ -170,17 +170,13 @@ class Trader:
 
                     if ba and ba - 1 > fairprice and ask_size > 0:
                         sellprice = ba - 1
-                        # if trending_down and ba - 2 > fairprice:
-                        #     sellprice = ba - 2
                         if trending_up and ba > fairprice:
-                            buyprice = ba
+                            sellprice = ba
                         orders.append(Order(prod, sellprice, -ask_size))
                         print(f"Order({prod}, {sellprice}, {-ask_size})")
 
                     if bb and bb + 1 < fairprice and bid_size > 0:
                         buyprice = bb + 1
-                        # if trending_up and bb + 2 < fairprice:
-                        #     buyprice = bb + 2
                         if trending_down and bb < fairprice:
                             buyprice = bb
                         orders.append(Order(prod, buyprice, bid_size))
@@ -188,26 +184,26 @@ class Trader:
 
                 #── Layer 3: zero-edge inventory neutralization ──────-
 
-                if pos >= FLAT_TARGET_HARD and sell_room > 0:
-                    # ``ba`` can be None when no ask is above ``meanfair``; fall back to best ask + 1.
-                    flat_price = (bb) if bb is not None else round(fairprice)
-                    flat_size  = min(pos - FLAT_TARGET_HARD, sell_room)
-                    orders.append(Order(prod, flat_price, -flat_size))
-                    print(f"Order({prod}, {flat_price}, {-flat_size})")
+                # if pos >= FLAT_TARGET_HARD and sell_room > 0:
+                #     # ``ba`` can be None when no ask is above ``meanfair``; fall back to best ask + 1.
+                #     flat_price = (bb) if bb is not None else round(fairprice)
+                #     flat_size  = min(pos - FLAT_TARGET_HARD, sell_room)
+                #     orders.append(Order(prod, flat_price, -flat_size))
+                #     print(f"Order({prod}, {flat_price}, {-flat_size})")
 
-                elif pos >= FLAT_THRESHOLD_SOFT and sell_room > 0:
+                if pos >= FLAT_THRESHOLD_SOFT and sell_room > 0:
                     flat_price = int(fairprice)
                     flat_size  = min(pos - FLAT_TARGET_SOFT, sell_room)
                     if flat_size > 0:
                         orders.append(Order(prod, flat_price, -flat_size))
                         print(f"Order({prod}, {flat_price}, {-flat_size})")
                 
-                elif pos <= -FLAT_TARGET_HARD and buy_room > 0:
-                    flat_price = (ba) if ba is not None else round(fairprice)
-                    flat_size  = min(-pos - FLAT_TARGET_HARD, buy_room)
-                    if flat_size > 0:
-                        orders.append(Order(prod, flat_price, flat_size))
-                        print(f"Order({prod}, {flat_price}, {flat_size})")
+                # elif pos <= -FLAT_TARGET_HARD and buy_room > 0:
+                #     flat_price = (ba) if ba is not None else round(fairprice)
+                #     flat_size  = min(-pos - FLAT_TARGET_HARD, buy_room)
+                #     if flat_size > 0:
+                #         orders.append(Order(prod, flat_price, flat_size))
+                #         print(f"Order({prod}, {flat_price}, {flat_size})")
 
                 elif pos <= -FLAT_THRESHOLD_SOFT and buy_room > 0:
                     flat_price = int(fairprice) + (1 if fairprice != int(fairprice) else 0)
