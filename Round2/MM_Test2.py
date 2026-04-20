@@ -171,6 +171,8 @@ class Trader:
 
                     if ba and ba - 1 > fairprice and ask_size > 0:
                         sellprice = ba - 1
+                        if trending_up and ba > fairprice:
+                            sellprice = ba
                         if trending_down and ba - 2 > fairprice:
                             sellprice = ba - 2
                         orders.append(Order(prod, sellprice, -ask_size))
@@ -178,6 +180,8 @@ class Trader:
 
                     if bb and bb + 1 < fairprice and bid_size > 0:
                         buyprice = bb + 1
+                        if trending_down and bb < fairprice:
+                            buyprice = bb
                         if trending_up and bb + 2 < fairprice:
                             buyprice = bb + 2
                         orders.append(Order(prod, buyprice, bid_size))
