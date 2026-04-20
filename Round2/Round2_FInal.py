@@ -23,7 +23,7 @@ def updatepos(pos: int, vol: int, maxpos: int = 80):
 
 class Trader:
 
-    def bid():
+    def bid(self):
         return 3000
 
     def run(self, state: TradingState):
