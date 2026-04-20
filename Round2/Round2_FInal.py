@@ -1,9 +1,7 @@
 from datamodel import Order, TradingState
 import json
 
-FLAT_THRESHOLD_HARD = 15
-FLAT_TARGET_HARD = 10
-FLAT_THRESHOLD_SOFT = FLAT_TARGET_HARD
+FLAT_THRESHOLD_SOFT = 10
 FLAT_TARGET_SOFT    = 0
 BASE           = 24  
 EMA_ALPHA = 0.05
@@ -24,6 +22,9 @@ def updatepos(pos: int, vol: int, maxpos: int = 80):
 
 
 class Trader:
+
+    def bid():
+        return 3000
 
     def run(self, state: TradingState):
         result = {}
@@ -189,26 +190,12 @@ class Trader:
 
                 #── Layer 3: zero-edge inventory neutralization ──────-
 
-                # if pos >= FLAT_THRESHOLD_HARD and sell_room > 0:
-                #     # ``ba`` can be None when no ask is above ``meanfair``; fall back to best ask + 1.
-                #     flat_price = (bb) if bb is not None else round(fairprice)
-                #     flat_size  = min(pos - FLAT_TARGET_HARD, sell_room)
-                #     orders.append(Order(prod, flat_price, -flat_size))
-                #     print(f"Order({prod}, {flat_price}, {-flat_size})")
-
                 if pos >= FLAT_THRESHOLD_SOFT and sell_room > 0:
                     flat_price = int(fairprice)
                     flat_size  = min(pos - FLAT_TARGET_SOFT, sell_room)
                     if flat_size > 0:
                         orders.append(Order(prod, flat_price, -flat_size))
                         print(f"Order({prod}, {flat_price}, {-flat_size})")
-                
-                # elif pos <= -FLAT_THRESHOLD_HARD and buy_room > 0:
-                #     flat_price = (ba) if ba is not None else round(fairprice)
-                #     flat_size  = min(-pos - FLAT_TARGET_HARD, buy_room)
-                #     if flat_size > 0:
-                #         orders.append(Order(prod, flat_price, flat_size))
-                #         print(f"Order({prod}, {flat_price}, {flat_size})")
 
                 elif pos <= -FLAT_THRESHOLD_SOFT and buy_room > 0:
                     flat_price = int(fairprice) + (1 if fairprice != int(fairprice) else 0)
