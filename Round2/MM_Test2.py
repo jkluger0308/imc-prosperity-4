@@ -142,7 +142,7 @@ class Trader:
                     #     orders.append(Order(prod, price, -size))
                     #     print(f"Order({prod}, {price}, {-size})")
                     #     pos, buy_room, sell_room = updatepos(pos, -size)
-                    if price > meanfair and sell_room > 0 and pos > 0:
+                    if price > meanfair and sell_room > 0 and pos > -10:
                         size = min(vol, sell_room)
                         orders.append(Order(prod, price, -size))
                         print(f"Order({prod}, {price}, {-size})")
@@ -154,7 +154,7 @@ class Trader:
                     #     orders.append(Order(prod, price, size))
                     #     print(f"Order({prod}, {price}, {size})")
                     #     pos, buy_room, sell_room = updatepos(pos, size)
-                    if price < meanfair and buy_room > 0 and pos < 0:
+                    if price < meanfair and buy_room > 0 and pos < 10:
                         size = min(-vol, buy_room)
                         orders.append(Order(prod, price, size))
                         print(f"Order({prod}, {price}, {size})")
@@ -171,9 +171,9 @@ class Trader:
 
                     if ba and ba - 1 > fairprice and ask_size > 0:
                         sellprice = ba - 1
-                        if trending_up and ba > fairprice:
+                        if (trending_up and ba > fairprice):
                             sellprice = ba
-                        if trending_down and ba - 2 > fairprice:
+                        elif trending_down and ba - 2 > fairprice:
                             sellprice = ba - 2
                         orders.append(Order(prod, sellprice, -ask_size))
                         print(f"Order({prod}, {sellprice}, {-ask_size})")
