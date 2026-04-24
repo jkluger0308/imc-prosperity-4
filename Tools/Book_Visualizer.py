@@ -43,11 +43,23 @@ except ImportError as e:  # pragma: no cover
 # Paths & cache
 # -----------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_ROOTS = [SCRIPT_DIR / "backtests", Path.home() / "Downloads"]
+# Two data sources exposed as separate dropdowns in the UI:
+#   - "Backtests": repo-level ``backtests/`` (prosperity4bt output) and the legacy
+#     ``tools/backtests/`` for locally generated logs.
+#   - "Downloads": submission exports and official round CSVs dropped in
+#     ``~/Downloads``.
+# Missing dirs are glob-safe so listing a non-existent path here is harmless.
+DEFAULT_BACKTEST_ROOTS = [
+    _REPO_ROOT / "backtests",
+    SCRIPT_DIR / "backtests",
+]
+DEFAULT_DOWNLOADS_ROOTS = [Path.home() / "Downloads"]
+# Back-compat: merged view used when callers treat the tool as a single bucket.
+DEFAULT_ROOTS = DEFAULT_BACKTEST_ROOTS + DEFAULT_DOWNLOADS_ROOTS
 CACHE_DIR = SCRIPT_DIR / ".cache_dashboard"
 GUIDE_PATH = SCRIPT_DIR / "ORDERBOOK_DASHBOARD_GUIDE.md"
 # Bump when parsed book/trade metrics change so stale pickles are not reused.
-PARSED_CACHE_VERSION = "19"
+PARSED_CACHE_VERSION = "21"
 ORDER_PRINT_RE = re.compile(
     r"Order\(\s*([^,]+?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)"
 )
@@ -119,6 +131,15 @@ def _strip_json_trailing_commas(s: str) -> str:
     return s
 
 
+def _strip_bom(s: str) -> str:
+    """Remove UTF-8 BOM so ``startswith('{')`` and CSV headers match reliably."""
+    return s[1:] if s.startswith("\ufeff") else s
+
+
+def _read_text_utf8(path: Path) -> str:
+    return _strip_bom(path.read_text(encoding="utf-8", errors="replace"))
+
+
 def _parse_json_loose(s: str) -> Any:
     s = _strip_json_trailing_commas(s.strip())
     return json.loads(s)
@@ -164,21 +185,40 @@ ACTIVITIES_HEADER = (
 )
 
 
+def _activities_header_for_sep(sep: str) -> str:
+    return ACTIVITIES_HEADER if sep == ";" else ACTIVITIES_HEADER.replace(";", ",")
+
+
+def _detect_activities_sep(first_line: str) -> str:
+    """Prosperity exports use ``;``; some tools emit comma-separated CSV."""
+    sc = first_line.count(";")
+    cc = first_line.count(",")
+    if sc == 0 and cc > 0:
+        return ","
+    if cc > sc:
+        return ","
+    return ";"
+
+
 def _parse_activities_csv(text: str) -> pd.DataFrame:
-    text = text.strip()
+    text = _strip_bom(text.strip())
     if not text:
         return pd.DataFrame()
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if not lines:
         return pd.DataFrame()
-    # Drop duplicate header inside body
-    if lines[0].startswith("day;timestamp;product"):
-        body = "\n".join(lines)
-    else:
-        body = ACTIVITIES_HEADER + "\n" + "\n".join(lines)
     from io import StringIO
 
-    df = pd.read_csv(StringIO(body), sep=";")
+    first = lines[0].lstrip()
+    sep = _detect_activities_sep(first)
+    low = first.lower()
+    has_header = low.startswith("day") and "timestamp" in low and "product" in low
+    if has_header and (low.startswith("day;timestamp;product") or low.startswith("day,timestamp,product")):
+        body = "\n".join(lines)
+    else:
+        body = _activities_header_for_sep(sep) + "\n" + "\n".join(lines)
+    df = pd.read_csv(StringIO(body), sep=sep)
+    df.columns = [str(c).strip() for c in df.columns]
     for c in df.columns:
         if c not in ("product",):
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -198,8 +238,8 @@ def _extract_between(text: str, start: str, end: Optional[str]) -> Optional[str]
     return text[i:].strip()
 
 
-def parse_backtester_log(path: Path) -> dict[str, Any]:
-    raw = path.read_text(encoding="utf-8", errors="replace")
+def parse_backtester_log_text(raw: str) -> dict[str, Any]:
+    raw = _strip_bom(raw)
 
     sandbox_block = _extract_between(raw, "Sandbox logs:", "\nActivities log:")
     logs_rows: list[dict] = []
@@ -246,6 +286,10 @@ def parse_backtester_log(path: Path) -> dict[str, Any]:
     }
 
 
+def parse_backtester_log(path: Path) -> dict[str, Any]:
+    return parse_backtester_log_text(_read_text_utf8(path))
+
+
 _OFFICIAL_PRICES_NAME_RE = re.compile(r"^prices_round_(\d+)_day_(-?\d+)\.csv$", re.IGNORECASE)
 
 
@@ -253,10 +297,11 @@ def _looks_like_official_prices_csv(path: Path) -> bool:
     if path.suffix.lower() != ".csv":
         return False
     try:
-        first = path.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+        first = _strip_bom(path.read_text(encoding="utf-8", errors="replace").splitlines()[0])
     except OSError:
         return False
-    return first.startswith("day;timestamp;product")
+    low = first.lower()
+    return low.startswith("day;timestamp;product") or low.startswith("day,timestamp,product")
 
 
 def _sibling_official_trades_csv(prices_path: Path) -> Path | None:
@@ -272,7 +317,7 @@ def parse_official_round_csv(prices_path: Path) -> dict[str, Any]:
     IMC-published round data: ``prices_round_R_day_D.csv`` (+ optional sibling
     ``trades_round_R_day_D.csv``). Same schema as backtester activities + trade list.
     """
-    raw_book = prices_path.read_text(encoding="utf-8", errors="replace")
+    raw_book = _read_text_utf8(prices_path)
     book_df = _parse_activities_csv(raw_book)
 
     trades_df = pd.DataFrame()
@@ -398,17 +443,44 @@ def _merge_trade_sources(root: dict[str, Any]) -> pd.DataFrame:
     return out.drop(columns=["_dedupe_sym"], errors="ignore")
 
 
-def parse_fronttest_dict(root: dict[str, Any], source_tag: str = "fronttest_json") -> dict[str, Any]:
-    act = root.get("activitiesLog") or root.get("activities_log")
-    book_df = _parse_activities_csv(act) if isinstance(act, str) else pd.DataFrame()
+_NESTED_EXPORT_KEYS = ("data", "payload", "result", "export", "body", "response")
 
-    trades_df = _merge_trade_sources(root)
 
-    logs_rows: list[dict[str, Any]] = []
-    for key in ("sandboxLogs", "sandbox_logs", "sandboxLog", "logs"):
-        if key not in root or not root[key]:
+def _norm_json_key(k: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(k).lower())
+
+
+def _activities_csv_from_root(root: dict[str, Any]) -> str:
+    """Case/spacing-insensitive match for ``activitiesLog`` / ``activities_log``."""
+    for k, v in root.items():
+        if not isinstance(v, str) or not v.strip():
             continue
-        val = root[key]
+        nk = _norm_json_key(k)
+        if nk in ("activitieslog", "activities_log"):
+            return v
+    return ""
+
+
+def _resolve_activities_blob(root: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Return (embedded CSV, dict that held it) — activities may live under ``data`` etc."""
+    blob = _activities_csv_from_root(root)
+    if blob:
+        return blob, root
+    for nk in _NESTED_EXPORT_KEYS:
+        inner = root.get(nk)
+        if isinstance(inner, dict):
+            blob = _activities_csv_from_root(inner)
+            if blob:
+                return blob, inner
+    return "", root
+
+
+def _sandbox_log_rows_from_dict(src: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for key in ("sandboxLogs", "sandbox_logs", "sandboxLog", "logs"):
+        if key not in src or not src[key]:
+            continue
+        val = src[key]
         if not isinstance(val, list):
             continue
         for item in val:
@@ -418,16 +490,25 @@ def parse_fronttest_dict(root: dict[str, Any], source_tag: str = "fronttest_json
             sb = item.get("sandboxLog") or item.get("message") or ""
             lm = item.get("lambdaLog") or ""
             if sb:
-                logs_rows.append({"timestamp": ts, "source": "sandbox", "message": str(sb)})
+                rows.append({"timestamp": ts, "source": "sandbox", "message": str(sb)})
             if lm:
-                logs_rows.append({"timestamp": ts, "source": "lambda", "message": str(lm)})
-        if logs_rows:
+                rows.append({"timestamp": ts, "source": "lambda", "message": str(lm)})
+        if rows:
             break
-    logs_df = pd.DataFrame(logs_rows) if logs_rows else pd.DataFrame(columns=["timestamp", "source", "message"])
+    return rows
 
+
+def _positions_from_dicts(*srcs: dict[str, Any]) -> pd.DataFrame:
     positions_rows: list[dict[str, Any]] = []
-    pos_raw = root.get("positions")
-    if isinstance(pos_raw, list):
+    seen: set[int] = set()
+    for root in srcs:
+        rid = id(root)
+        if rid in seen:
+            continue
+        seen.add(rid)
+        pos_raw = root.get("positions")
+        if not isinstance(pos_raw, list):
+            continue
         for item in pos_raw:
             if not isinstance(item, dict):
                 continue
@@ -439,20 +520,80 @@ def parse_fronttest_dict(root: dict[str, Any], source_tag: str = "fronttest_json
                     "quantity": pd.to_numeric(q, errors="coerce"),
                 }
             )
-    positions_df = pd.DataFrame(positions_rows) if positions_rows else pd.DataFrame()
+        if positions_rows:
+            break
+    return pd.DataFrame(positions_rows) if positions_rows else pd.DataFrame()
+
+
+def _coerce_export_dict(obj: Any) -> Optional[dict[str, Any]]:
+    """``[ {...} ]`` wrappers and obvious prosperity dict roots."""
+    if isinstance(obj, dict):
+        return obj
+    if isinstance(obj, list):
+        for el in obj:
+            if not isinstance(el, dict):
+                continue
+            if _activities_csv_from_root(el) or el.get("tradeHistory") or el.get("trade_history") or el.get("logs"):
+                return el
+        for el in obj:
+            if isinstance(el, dict):
+                return el
+    return None
+
+
+def _prosperity_json_export_looks_usable(root: dict[str, Any]) -> bool:
+    if _activities_csv_from_root(root):
+        return True
+    for nk in _NESTED_EXPORT_KEYS:
+        inner = root.get(nk)
+        if isinstance(inner, dict) and _activities_csv_from_root(inner):
+            return True
+    if root.get("tradeHistory") or root.get("trade_history") or root.get("logs"):
+        return True
+    return False
+
+
+def parse_fronttest_dict(root: dict[str, Any], source_tag: str = "fronttest_json") -> dict[str, Any]:
+    act_blob, act_host = _resolve_activities_blob(root)
+    book_df = _parse_activities_csv(act_blob) if act_blob else pd.DataFrame()
+
+    trades_df = _merge_trade_sources(root)
+    if trades_df.empty and act_host is not root:
+        trades_df = _merge_trade_sources(act_host)
+
+    logs_rows = _sandbox_log_rows_from_dict(root)
+    if not logs_rows and act_host is not root:
+        logs_rows = _sandbox_log_rows_from_dict(act_host)
+    logs_df = pd.DataFrame(logs_rows) if logs_rows else pd.DataFrame(columns=["timestamp", "source", "message"])
+
+    positions_df = _positions_from_dicts(root, act_host)
 
     graphlog_df = pd.DataFrame()
-    gl = root.get("graphLog") or root.get("graph_log")
-    if isinstance(gl, str) and gl.strip():
-        try:
-            graphlog_df = _parse_graph_log_csv(gl)
-        except Exception:
-            graphlog_df = pd.DataFrame()
+    _seen_src: set[int] = set()
+    for src in (root, act_host):
+        sid = id(src)
+        if sid in _seen_src:
+            continue
+        _seen_src.add(sid)
+        gl = src.get("graphLog") or src.get("graph_log")
+        if isinstance(gl, str) and gl.strip():
+            try:
+                graphlog_df = _parse_graph_log_csv(gl)
+            except Exception:
+                graphlog_df = pd.DataFrame()
+            if not graphlog_df.empty:
+                break
 
     submission_meta: dict[str, Any] = {}
-    for mk in ("profit", "round", "status", "submissionId", "submission_id"):
-        if mk in root and root[mk] is not None:
-            submission_meta[mk] = root[mk]
+    _seen_src = set()
+    for ext in (root, act_host):
+        eid = id(ext)
+        if eid in _seen_src:
+            continue
+        _seen_src.add(eid)
+        for mk in ("profit", "round", "status", "submissionId", "submission_id"):
+            if mk in ext and ext[mk] is not None and mk not in submission_meta:
+                submission_meta[mk] = ext[mk]
 
     return {
         "book_df": book_df,
@@ -466,12 +607,13 @@ def parse_fronttest_dict(root: dict[str, Any], source_tag: str = "fronttest_json
 
 
 def parse_fronttest_json(path: Path) -> dict[str, Any]:
-    raw = path.read_text(encoding="utf-8", errors="replace")
+    raw = _read_text_utf8(path)
     try:
-        root = _parse_json_loose(raw)
+        obj = _parse_json_loose(raw)
     except json.JSONDecodeError:
         return _empty_parse_result("json_error")
-    if not isinstance(root, dict):
+    root = _coerce_export_dict(obj)
+    if root is None:
         return _empty_parse_result("json_error")
     return parse_fronttest_dict(root, "fronttest_json")
 
@@ -486,15 +628,17 @@ def parse_log_file(path: Path) -> dict[str, Any]:
     if suf == ".json":
         return parse_fronttest_json(path)
     if suf == ".log":
-        raw = path.read_text(encoding="utf-8", errors="replace").strip()
-        if raw.startswith("{"):
+        raw = _read_text_utf8(path)
+        stripped = raw.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
             try:
-                root = _parse_json_loose(raw)
-                if isinstance(root, dict) and (root.get("activitiesLog") or root.get("activities_log")):
-                    return parse_fronttest_dict(root, "fronttest_json_log")
+                obj = _parse_json_loose(stripped)
+                rd = _coerce_export_dict(obj)
+                if rd is not None and _prosperity_json_export_looks_usable(rd):
+                    return parse_fronttest_dict(rd, "fronttest_json_log")
             except json.JSONDecodeError:
                 pass
-    return parse_backtester_log(path)
+        return parse_backtester_log_text(raw)
 
 
 # -----------------------------------------------------------------------------
@@ -1528,6 +1672,14 @@ def _format_submission_meta(meta: dict[str, Any]) -> str:
     sid = meta.get("submissionId") or meta.get("submission_id")
     if sid:
         parts.append(f"**Submission:** `{sid}`")
+    if meta.get("book_day_span"):
+        parts.append(f"**Book days:** {meta['book_day_span']}")
+    if meta.get("book_timesteps") is not None:
+        parts.append(f"**Book timesteps:** {meta['book_timesteps']:,}")
+    if meta.get("book_row_count") is not None:
+        parts.append(f"**Book rows:** {meta['book_row_count']:,}")
+    if meta.get("book_products") is not None:
+        parts.append(f"**Book products:** {meta['book_products']}")
     return " · ".join(parts) if parts else ""
 
 
@@ -1547,6 +1699,27 @@ def logs_at_hover(logs_df: pd.DataFrame, ts: Optional[float], window: int = 500)
         ts_show = int(r["_tsn"]) if pd.notna(r["_tsn"]) else r["timestamp"]
         lines.append(f"**{ts_show}** [{r.get('source','')}] {r.get('message','')}")
     return "\n\n".join(lines[:80])
+
+
+def _build_log_panel_markdown(
+    store: Optional[dict[str, Any]],
+    product: Optional[str],
+    hover: Optional[dict[str, Any]],
+) -> str:
+    """Sandbox log + order/fill audit for the hovered main-chart x (or no hover)."""
+    if not store or not store.get("path"):
+        return "_Select a file._"
+    d = load_parsed(store["path"], use_cache=True)
+    if not product or product == "NONE":
+        return "_Select a product._"
+    logs = d.get("logs_df", pd.DataFrame())
+    trades = d.get("trades_df", pd.DataFrame())
+    ts = None
+    if hover and isinstance(hover, dict) and hover.get("points"):
+        ts = hover["points"][0].get("x")
+    log_text = logs_at_hover(logs, ts)
+    audit_text = build_order_fill_audit_markdown(logs, trades, ts, product)
+    return f"{log_text}\n\n---\n\n{audit_text}"
 
 
 def _side_from_qty(qty: float) -> str:
@@ -1739,22 +1912,57 @@ def _optional_float(v: Any) -> Optional[float]:
 
 def _looks_like_prosperity_json(path: Path) -> bool:
     try:
-        head = path.read_text(encoding="utf-8", errors="replace")[:8192]
+        head = _strip_bom(path.read_text(encoding="utf-8", errors="replace")[:8192])
     except OSError:
         return False
-    return "activitiesLog" in head or "activities_log" in head or "day;timestamp;product" in head
+    if "day;timestamp;product" in head or "day,timestamp,product" in head.lower():
+        return True
+    if re.search(r'"activities[_-]?log"\s*:', head, re.I):
+        return True
+    return '"tradeHistory"' in head or '"trade_history"' in head or '"logs"' in head
 
 
 def _looks_like_prosperity_log(path: Path) -> bool:
     """Keep backtester text logs and JSON submission `.log` files; drop unrelated logs."""
     try:
-        head = path.read_text(encoding="utf-8", errors="replace")[:32768]
+        head = _strip_bom(path.read_text(encoding="utf-8", errors="replace")[:32768])
     except OSError:
         return False
     h = head.strip()
-    if h.startswith("{"):
+    if h.startswith("{") or h.startswith("["):
+        if re.search(r'"activities[_-]?log"\s*:', head, re.I):
+            return True
+        if '"tradeHistory"' in head or '"trade_history"' in head or '"logs"' in head:
+            return True
         return "activitiesLog" in head or "activities_log" in head
     return "Activities log:" in head or "Sandbox logs:" in head
+
+
+def _file_sort_key(opt: dict) -> tuple:
+    """Order options by usefulness:
+      0) Official round CSVs, newest round first, then day ascending.
+      1) Submission exports (JSON/log living in a numeric subdir like ``344619/``),
+         newest submission id first.
+      2) Backtester text logs (``YYYY-MM-DD_HH-MM-SS.log``), newest first.
+      3) Everything else, newest first.
+    """
+    p = Path(opt["value"])
+    name = p.name
+    try:
+        mtime = -p.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+
+    m = _OFFICIAL_PRICES_NAME_RE.match(name)
+    if m:
+        return (0, -int(m.group(1)), int(m.group(2)), opt["label"])
+
+    parent = p.parent.name
+    if parent.isdigit() and p.suffix.lower() in (".json", ".log"):
+        # Inside submissions, prefer ``.log`` (human-readable) over ``.json`` when ids match.
+        return (1, -int(parent), 0 if p.suffix.lower() == ".log" else 1, opt["label"])
+
+    return (2 if p.suffix.lower() == ".log" else 3, mtime, opt["label"])
 
 
 def discover_log_files(roots: list[Path]) -> list[dict]:
@@ -1785,7 +1993,28 @@ def discover_log_files(roots: list[Path]) -> list[dict]:
         if o["value"] not in seen:
             seen.add(o["value"])
             out.append(o)
-    return sorted(out, key=lambda x: x["label"])
+    return sorted(out, key=_file_sort_key)
+
+
+def _enrich_submission_meta_from_book(meta: dict[str, Any], book_df: pd.DataFrame) -> None:
+    """When JSON exports omit ``round``/``profit``, still show book coverage (new rounds)."""
+    if not isinstance(meta, dict) or book_df.empty:
+        return
+    if "day" in book_df.columns:
+        ds = pd.to_numeric(book_df["day"], errors="coerce")
+        if ds.notna().any():
+            meta.setdefault("book_day_span", f"{int(ds.min())}-{int(ds.max())}")
+    if "timestamp" in book_df.columns and "day" in book_df.columns:
+        try:
+            ticks = book_df.groupby(["day", "timestamp"], sort=False).ngroups
+            meta.setdefault("book_timesteps", int(ticks))
+        except Exception:
+            pass
+    meta.setdefault("book_row_count", len(book_df))
+    if "product" in book_df.columns:
+        ser = book_df["product"].astype(str).str.strip()
+        ser = ser[ser.ne("") & ~ser.str.lower().isin(("nan", "none"))]
+        meta.setdefault("book_products", int(ser.nunique()))
 
 
 def load_parsed(path_str: str, use_cache: bool = True) -> dict:
@@ -1800,6 +2029,11 @@ def load_parsed(path_str: str, use_cache: bool = True) -> dict:
         if hit is not None:
             return hit
     data = parse_log_file(path)
+    meta = data.get("submission_meta")
+    if not isinstance(meta, dict):
+        data["submission_meta"] = {}
+        meta = data["submission_meta"]
+    _enrich_submission_meta_from_book(meta, data.get("book_df", pd.DataFrame()))
     if not data["book_df"].empty:
         data["book_df"] = add_book_metrics(data["book_df"])
     if not data["trades_df"].empty:
@@ -1816,9 +2050,20 @@ def load_parsed(path_str: str, use_cache: bool = True) -> dict:
 # -----------------------------------------------------------------------------
 # Dash application
 # -----------------------------------------------------------------------------
-def create_app(roots: list[Path]) -> Dash:
-    file_options = discover_log_files(roots)
-    default_file = file_options[0]["value"] if file_options else ""
+def create_app(
+    backtest_roots: list[Path],
+    downloads_roots: list[Path],
+) -> Dash:
+    backtest_options = discover_log_files(backtest_roots)
+    downloads_options = discover_log_files(downloads_roots)
+    default_bt = backtest_options[0]["value"] if backtest_options else ""
+    default_dl = downloads_options[0]["value"] if downloads_options else ""
+    # Prefer the source that actually has files; default to backtests when both exist.
+    default_source = "backtests" if backtest_options or not downloads_options else "downloads"
+    default_file = default_bt if default_source == "backtests" else default_dl
+    # The hidden relay dropdown holds the active file path, so downstream callbacks
+    # (``load_file``, ``sync_viewport``) continue to observe a single ``file-dd.value``.
+    merged_options = backtest_options + downloads_options
 
     app = Dash(__name__, suppress_callback_exceptions=True)
     app.title = "IMC Order Book Dashboard"
@@ -1829,8 +2074,54 @@ def create_app(roots: list[Path]) -> Dash:
             dcc.Markdown(id="submission-meta", style={"marginBottom": "10px", "fontSize": "14px"}),
             html.Div(
                 [
-                    html.Label("Log / JSON file"),
-                    dcc.Dropdown(id="file-dd", options=file_options, value=default_file, clearable=False, style={"minWidth": "420px"}),
+                    html.Label("Source"),
+                    dcc.RadioItems(
+                        id="source-toggle",
+                        options=[
+                            {"label": f"Backtests ({len(backtest_options)})", "value": "backtests"},
+                            {"label": f"Downloads ({len(downloads_options)})", "value": "downloads"},
+                        ],
+                        value=default_source,
+                        inline=True,
+                    ),
+                    html.Div(
+                        [
+                            html.Label("Backtests file"),
+                            dcc.Dropdown(
+                                id="file-dd-backtests",
+                                options=backtest_options,
+                                value=default_bt,
+                                clearable=False,
+                                placeholder="No .log files found in backtests/",
+                                style={"minWidth": "420px"},
+                            ),
+                        ],
+                        id="backtests-dd-wrap",
+                        style={"display": "block" if default_source == "backtests" else "none"},
+                    ),
+                    html.Div(
+                        [
+                            html.Label("Downloads file"),
+                            dcc.Dropdown(
+                                id="file-dd-downloads",
+                                options=downloads_options,
+                                value=default_dl,
+                                clearable=False,
+                                placeholder="No .log/.json/CSV files found in Downloads/",
+                                style={"minWidth": "420px"},
+                            ),
+                        ],
+                        id="downloads-dd-wrap",
+                        style={"display": "block" if default_source == "downloads" else "none"},
+                    ),
+                    # Hidden relay: every downstream callback reads from here.
+                    dcc.Dropdown(
+                        id="file-dd",
+                        options=merged_options,
+                        value=default_file,
+                        clearable=False,
+                        style={"display": "none"},
+                    ),
                     html.Label("Product"),
                     dcc.Dropdown(id="product-dd", clearable=False),
                     html.Label("Normalization"),
@@ -1926,12 +2217,28 @@ def create_app(roots: list[Path]) -> Dash:
             ),
             dcc.Store(id="parsed-store"),
             dcc.Store(id="viewport-store", data=None),
-            dcc.Graph(id="main-graph", style={"height": "540px"}),
-            dcc.Graph(id="total-pnl-graph", style={"height": "200px", "maxWidth": "1400px"}),
+            # Loading spinners make the re-render of large Round-3 figures feel like
+            # progress instead of a freeze (the main figure is ~1.7MB per product).
+            dcc.Loading(
+                type="circle",
+                children=dcc.Graph(id="main-graph", style={"height": "540px"}),
+            ),
+            dcc.Loading(
+                type="circle",
+                children=dcc.Graph(id="total-pnl-graph", style={"height": "200px", "maxWidth": "1400px"}),
+            ),
             html.Div(
                 [
-                    dcc.Graph(id="pnl-graph", style={"width": "33%", "display": "inline-block"}),
-                    dcc.Graph(id="pos-graph", style={"width": "33%", "display": "inline-block"}),
+                    dcc.Loading(
+                        type="circle",
+                        children=dcc.Graph(id="pnl-graph", style={"width": "100%"}),
+                        parent_style={"width": "33%", "display": "inline-block"},
+                    ),
+                    dcc.Loading(
+                        type="circle",
+                        children=dcc.Graph(id="pos-graph", style={"width": "100%"}),
+                        parent_style={"width": "33%", "display": "inline-block"},
+                    ),
                     dcc.Markdown(id="log-md", style={"width": "33%", "display": "inline-block", "verticalAlign": "top", "maxHeight": "260px", "overflowY": "scroll", "backgroundColor": "#111", "padding": "8px"}),
                 ]
             ),
@@ -1945,6 +2252,20 @@ def create_app(roots: list[Path]) -> Dash:
         ],
         style={"maxWidth": "1400px", "margin": "0 auto", "padding": "12px", "fontFamily": "system-ui"},
     )
+
+    @app.callback(
+        Output("file-dd", "value"),
+        Output("backtests-dd-wrap", "style"),
+        Output("downloads-dd-wrap", "style"),
+        Input("source-toggle", "value"),
+        Input("file-dd-backtests", "value"),
+        Input("file-dd-downloads", "value"),
+    )
+    def route_source(source, bt_value, dl_value):
+        bt_style = {"display": "block" if source == "backtests" else "none"}
+        dl_style = {"display": "block" if source == "downloads" else "none"}
+        active = bt_value if source == "backtests" else dl_value
+        return (active or ""), bt_style, dl_style
 
     @app.callback(
         Output("parsed-store", "data"),
@@ -2006,7 +2327,6 @@ def create_app(roots: list[Path]) -> Dash:
         Output("main-graph", "figure"),
         Output("pnl-graph", "figure"),
         Output("pos-graph", "figure"),
-        Output("log-md", "children"),
         Output("total-pnl-graph", "figure"),
         Output("submission-meta", "children"),
         Input("parsed-store", "data"),
@@ -2022,7 +2342,6 @@ def create_app(roots: list[Path]) -> Dash:
         Input("zscore-span", "value"),
         Input("rsi-period", "value"),
         Input("size-bucket-cl", "value"),
-        Input("main-graph", "hoverData"),
         State("viewport-store", "data"),
     )
     def update_plots(
@@ -2039,20 +2358,19 @@ def create_app(roots: list[Path]) -> Dash:
         zscore_span,
         rsi_period_val,
         size_buckets,
-        hover,
         viewport,
     ):
         empty = go.Figure()
         empty.update_layout(template="plotly_dark")
         if not store or not store.get("path"):
             z = build_total_pnl_graphlog_figure(pd.DataFrame())
-            return empty, empty, empty, "_Select a file._", z, ""
+            return empty, empty, empty, z, ""
         d = load_parsed(store["path"], use_cache=True)
         meta_md = _format_submission_meta(d.get("submission_meta") or {})
         graphlog_df = d.get("graphlog_df", pd.DataFrame())
         tot_pnl = build_total_pnl_graphlog_figure(graphlog_df if isinstance(graphlog_df, pd.DataFrame) else pd.DataFrame())
         if not product or product == "NONE":
-            return empty, empty, empty, "_Select a product._", tot_pnl, meta_md
+            return empty, empty, empty, tot_pnl, meta_md
         book = d["book_df"]
         trades = d.get("trades_df", pd.DataFrame())
         logs = d.get("logs_df", pd.DataFrame())
@@ -2104,13 +2422,18 @@ def create_app(roots: list[Path]) -> Dash:
             logs if isinstance(logs, pd.DataFrame) else pd.DataFrame(),
         )
 
-        ts = None
-        if hover and "points" in hover and hover["points"]:
-            ts = hover["points"][0].get("x")
-        log_text = logs_at_hover(logs, ts)
-        audit_text = build_order_fill_audit_markdown(logs, trades, ts, product)
-        log_text = f"{log_text}\n\n---\n\n{audit_text}"
-        return main, pnl, pos, log_text, tot_pnl, meta_md
+        return main, pnl, pos, tot_pnl, meta_md
+
+    @app.callback(
+        Output("log-md", "children"),
+        Input("parsed-store", "data"),
+        Input("product-dd", "value"),
+        Input("main-graph", "hoverData"),
+    )
+    def update_log_panel(store, product, hover):
+        # Hover must not trigger ``update_plots`` — that rebuilds all figures and
+        # toggles ``dcc.Loading``, which flashes the whole chart stack on mousemove.
+        return _build_log_panel_markdown(store, product, hover)
 
     return app
 
@@ -2150,7 +2473,18 @@ def main() -> None:
     ap.add_argument(
         "--root",
         action="append",
-        help="Root folder to scan for .log/.json/official prices_round_*_day_*.csv (repeatable)",
+        help=(
+            "Extra root folder for the Backtests dropdown "
+            "(.log/.json/official prices_round_*_day_*.csv, repeatable)"
+        ),
+    )
+    ap.add_argument(
+        "--downloads-root",
+        action="append",
+        help=(
+            "Override root(s) for the Downloads dropdown "
+            "(defaults to ~/Downloads, repeatable)"
+        ),
     )
     ap.add_argument("--port", type=int, default=8050, help="Listen port (0 = OS picks a port)")
     ap.add_argument(
@@ -2162,8 +2496,17 @@ def main() -> None:
     )
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
-    roots = [Path(p) for p in args.root] if args.root else DEFAULT_ROOTS
-    app = create_app(roots)
+    # ``--root`` adds to the Backtests bucket so the Downloads dropdown stays
+    # focused on submission exports / official CSVs.
+    backtest_roots = list(DEFAULT_BACKTEST_ROOTS)
+    if args.root:
+        backtest_roots.extend(Path(p) for p in args.root)
+    downloads_roots = (
+        [Path(p) for p in args.downloads_root]
+        if args.downloads_root
+        else list(DEFAULT_DOWNLOADS_ROOTS)
+    )
+    app = create_app(backtest_roots, downloads_roots)
     preferred = args.port
     if preferred == 0:
         port = _resolve_listening_port(0)
