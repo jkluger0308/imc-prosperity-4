@@ -121,7 +121,7 @@ class Trader:
             buy_room = 200 - pos
             orders = []
 
-            if prod =="HYDROGEL PACK":
+            if prod =="HYDROGEL_PACK":
                 
                 rsi_key = f"rsi_{prod}"
                 rsi_st = prev.get(rsi_key, {})
