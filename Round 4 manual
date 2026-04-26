@@ -1,0 +1,112 @@
+import math
+import random
+
+# ── market constants (Admin Rule: 1 week = 5 trading days) ─────────────────────
+S0            = 50.0
+SIGMA         = 2.51         
+TRADING_DAYS  = 252
+STEPS_PER_DAY = 4
+CONTRACT_SIZE = 3_000        
+
+# T=15 (3 weeks), T=10 (2 weeks)
+CONTRACTS = {
+    "AC":        dict(type="spot",    K=0,  T=15, ask=50.025, bid=49.975, max_vol=200, barrier=None, binary_pay=None, chooser_t=None),
+    "AC_50_P":   dict(type="put",     K=50, T=15, ask=12.050, bid=12.000, max_vol=50,  barrier=None, binary_pay=None, chooser_t=None),
+    "AC_50_C":   dict(type="call",    K=50, T=15, ask=12.050, bid=12.000, max_vol=50,  barrier=None, binary_pay=None, chooser_t=None),
+    "AC_35_P":   dict(type="put",     K=35, T=15, ask= 4.350, bid= 4.330, max_vol=50,  barrier=None, binary_pay=None, chooser_t=None),
+    "AC_40_P":   dict(type="put",     K=40, T=15, ask= 6.550, bid= 6.500, max_vol=50,  barrier=None, binary_pay=None, chooser_t=None),
+    "AC_45_P":   dict(type="put",     K=45, T=15, ask= 9.100, bid= 9.050, max_vol=50,  barrier=None, binary_pay=None, chooser_t=None),
+    "AC_60_C":   dict(type="call",    K=60, T=15, ask= 8.850, bid= 8.800, max_vol=50,  barrier=None, binary_pay=None, chooser_t=None),
+    "AC_50_P_2": dict(type="put",     K=50, T=10, ask= 9.750, bid= 9.700, max_vol=50,  barrier=None, binary_pay=None, chooser_t=None),
+    "AC_50_C_2": dict(type="call",    K=50, T=10, ask= 9.750, bid= 9.700, max_vol=50,  barrier=None, binary_pay=None, chooser_t=None),
+    "AC_50_CO":  dict(type="chooser", K=50, T=15, ask=22.300, bid=22.200, max_vol=50,  barrier=None, binary_pay=None, chooser_t=10),
+    "AC_40_BP":  dict(type="binary",  K=40, T=15, ask= 5.100, bid= 5.000, max_vol=50,  barrier=None, binary_pay=10,   chooser_t=None),
+    "AC_45_KO":  dict(type="ko",      K=45, T=15, ask= 0.175, bid= 0.150, max_vol=500, barrier=35,   binary_pay=None, chooser_t=None),
+}
+
+N_SIMS = 1000000  
+SEED   = 42
+
+def norm_sample():
+    while True:
+        u, v = random.random(), random.random()
+        if u > 0: return math.sqrt(-2 * math.log(u)) * math.cos(2 * math.pi * v)
+
+def simulate_path(max_T=15, sigma=SIGMA, s0=S0):
+    total_steps = max_T * STEPS_PER_DAY
+    dt = 1.0 / (TRADING_DAYS * STEPS_PER_DAY)
+    path = [s0]; S = s0
+    for _ in range(total_steps):
+        S = S * math.exp(-0.5*sigma**2*dt + sigma*math.sqrt(dt)*norm_sample())
+        path.append(S)
+    return path
+
+def raw_payoff(cid, path):
+    c = CONTRACTS[cid]; K = c["K"]; T = c["T"]; final_step = T * STEPS_PER_DAY; SF = path[final_step]
+    if c["type"] == "spot": return SF
+    if c["type"] == "put": return max(K - SF, 0.0)
+    if c["type"] == "call": return max(SF - K, 0.0)
+    if c["type"] == "binary": return float(c["binary_pay"]) if SF < K else 0.0
+    if c["type"] == "ko":
+        for i in range(1, final_step + 1):
+            if path[i] < c["barrier"]: return 0.0
+        return max(K - SF, 0.0)
+    if c["type"] == "chooser":
+        # Simplified simulation-based chooser: picks the better side at chooser_t
+        SC = path[c["chooser_t"] * STEPS_PER_DAY]
+        # In driftless model, choice is basically based on distance to strike at time t
+        return max(SF - K, 0.0) if SF > K else max(K - SF, 0.0)
+    return 0.0
+
+def sweep_contract(cid, payoffs):
+    c = CONTRACTS[cid]; n = len(payoffs); results = []
+    # Baseline
+    results.append(dict(side="SKIP", vol=0, ep_total=0.0))
+    for side in ("BUY", "SELL"):
+        prem = c["ask"] if side == "BUY" else c["bid"]
+        for vol in range(1, c["max_vol"] + 1):
+            # (Payoff - Premium) if BUY, (Premium - Payoff) if SELL
+            pnls = [(p - prem if side == "BUY" else prem - p) for p in payoffs]
+            ep_total = (sum(pnls) / n) * vol * CONTRACT_SIZE
+            results.append(dict(side=side, vol=vol, ep_total=ep_total))
+    return results
+
+def main():
+    random.seed(SEED)
+    print(f"Building payoff table for {N_SIMS} simulations...")
+    table = {cid: [] for cid in CONTRACTS}
+    for _ in range(N_SIMS):
+        path = simulate_path(max_T=15)
+        for cid in CONTRACTS: table[cid].append(raw_payoff(cid, path))
+    
+    print("\n" + "="*60)
+    print("STARTING EXHAUSTIVE SWEEP")
+    print("="*60)
+
+    final_best_portfolio = []
+
+    for cid in CONTRACTS:
+        print(f"\n--- ALL POSSIBILITIES FOR {cid} ---")
+        all_combos = sweep_contract(cid, table[cid])
+        
+        # Sort current contract combos to find the best one
+        sorted_combos = sorted(all_combos, key=lambda x: x['ep_total'], reverse=True)
+        
+        # Print EVERY combination
+        for r in all_combos:
+            best_tag = " <--- BEST OPTION" if r == sorted_combos[0] else ""
+            print(f"{r['side']:<5} Volume: {r['vol']:>3} | Expected PnL: {r['ep_total']:>15,.2f} {best_tag}")
+        
+        final_best_portfolio.append((cid, sorted_combos[0]))
+
+    print("\n" + "#"*60)
+    print("FINAL RECOMMENDATION SUMMARY")
+    print("#"*60)
+    grand_total = 0
+    for cid, best in final_best_portfolio:
+        grand_total += best['ep_total']
+        print(f"{cid:<12}: {best['side']:<5} Vol {best['vol']:>3} | PnL: {best['ep_total']:>15,.2f}")
+    print(f"{'─'*60}\nTOTAL PORTFOLIO EXPECTED PnL: {grand_total:,.2f}")
+
+if __name__ == "__main__":
+    main()
