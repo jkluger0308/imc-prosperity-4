@@ -1,0 +1,1 @@
+if player is -1, send planet value + like 5 or 6
